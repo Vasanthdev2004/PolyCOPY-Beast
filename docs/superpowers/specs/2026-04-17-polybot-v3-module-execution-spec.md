@@ -73,6 +73,7 @@ The system is eligible for first safe live deployment only when all of the follo
 - Module 4 `Must-have` complete
 - Module 5 minimal live dashboard complete
 - Simulation mode is fully validated
+- All critical paths have been tested in both simulation mode and shadow mode before M3
 - Small-capital deployment safeguards are active
 
 ### 3.2 Should-Have For v3
@@ -217,6 +218,7 @@ Turn a validated signal into a correctly risk-checked, correctly-priced, correct
 - Retryable failures follow capped exponential backoff with jitter.
 - Non-retryable failures are recorded immediately.
 - Simulation mode never places a real order.
+- In simulation mode, no real HTTP/WebSocket calls are made to the Polymarket CLOB API.
 - Daily loss, min balance, and circuit breaker conditions prevent new execution.
 - Execution timestamps and latency metrics are emitted for every trade attempt.
 
@@ -438,6 +440,11 @@ It should feel like:
 - legible
 - reliable
 - operationally focused
+- trustworthy
+- minimal design
+- high contrast
+- green = healthy, amber/red = alert
+- clarity and quick scanning over dense information
 
 It should avoid:
 
