@@ -6,16 +6,17 @@ pub mod sizer;
 use polybot_common::constants::{
     confidence_multiplier, drawdown_multiplier as calc_drawdown, secret_level_multiplier,
 };
-use polybot_common::constants::{MAX_POSITION_USDC, MIN_POSITION_USDC};
 use rust_decimal::prelude::ToPrimitive;
 use polybot_common::types::{Decision, RiskDecision, Signal};
 use rust_decimal::Decimal;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::config::{AppConfig, RiskConfig};
 use crate::metrics::Metrics;
+use crate::risk::balance::DynamicBaseSize;
 use crate::state::positions::PositionManager;
 use crate::state::sqlite::SqliteStore;
 use crate::telegram_bot::alerts::AlertBroadcaster;
@@ -29,6 +30,9 @@ pub struct RiskEngine {
     position_manager: Arc<Mutex<PositionManager>>,
     runtime_risk: Arc<RwLock<RiskConfig>>,
     followed_wallets: Arc<RwLock<BTreeSet<String>>>,
+    balance_manager: Arc<DynamicBaseSize>,
+    consecutive_losses: Arc<Mutex<u32>>,
+    cooldown_until: Arc<Mutex<Option<Instant>>>,
     alerts: Option<AlertBroadcaster>,
 }
 
@@ -50,6 +54,11 @@ impl RiskEngine {
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
+        let initial_balance = if config.risk.base_size_pct > Decimal::ZERO {
+            config.risk.base_size_usd / config.risk.base_size_pct
+        } else {
+            config.risk.base_size_usd
+        };
 
         Self {
             config,
@@ -60,6 +69,9 @@ impl RiskEngine {
             position_manager,
             runtime_risk: Arc::new(RwLock::new(runtime_risk)),
             followed_wallets: Arc::new(RwLock::new(followed_wallets)),
+            balance_manager: Arc::new(DynamicBaseSize::new(initial_balance)),
+            consecutive_losses: Arc::new(Mutex::new(0)),
+            cooldown_until: Arc::new(Mutex::new(None)),
             alerts,
         }
     }
@@ -74,6 +86,7 @@ impl RiskEngine {
 
     pub async fn evaluate(&self, signal: &Signal) -> RiskDecision {
         let risk_config = self.runtime_risk.read().await.clone();
+        let current_balance = self.balance_manager.current_balance();
 
         // 1. Check emergency stop
         if *self.emergency_stop.lock().await {
@@ -90,6 +103,47 @@ impl RiskEngine {
                 manual_review: false,
                 decision: Decision::EmergencyStop,
             };
+        }
+
+        if current_balance < risk_config.min_usdc_balance {
+            self.set_emergency_stop(true).await;
+            if let Some(alerts) = &self.alerts {
+                alerts.critical(format!(
+                    "USDC balance ${} fell below minimum ${}. Trading auto-paused.",
+                    current_balance, risk_config.min_usdc_balance
+                ));
+            }
+            return RiskDecision {
+                signal_id: signal.signal_id.clone(),
+                market_id: signal.market_id.clone(),
+                side: signal.side,
+                category: signal.category,
+                position_size_usd: Decimal::ZERO,
+                confidence_multiplier: Decimal::ZERO,
+                secret_level_multiplier: Decimal::ZERO,
+                drawdown_factor: Decimal::ZERO,
+                blocked: true,
+                manual_review: false,
+                decision: Decision::EmergencyStop,
+            };
+        }
+
+        if let Some(cooldown_until) = *self.cooldown_until.lock().await {
+            if Instant::now() < cooldown_until {
+                return RiskDecision {
+                    signal_id: signal.signal_id.clone(),
+                    market_id: signal.market_id.clone(),
+                    side: signal.side,
+                    category: signal.category,
+                    position_size_usd: Decimal::ZERO,
+                    confidence_multiplier: Decimal::ZERO,
+                    secret_level_multiplier: Decimal::ZERO,
+                    drawdown_factor: Decimal::ZERO,
+                    blocked: true,
+                    manual_review: false,
+                    decision: Decision::Skip("loss cooldown active".to_string()),
+                };
+            }
         }
 
         let followed_wallets = self.followed_wallets.read().await;
@@ -205,20 +259,18 @@ impl RiskEngine {
             };
         }
 
-        // 6. v2.5: Position sizing
-        let mut size = risk_config.base_size_usd * conf_mult * sl_mult * dd_factor;
-
-        // Clamp to [MIN_POSITION_USDC, MAX_POSITION_USDC]
-        // Also v2.5: cap by per-category max single position
+        // 6. v3: runtime position sizing
+        let target_size_usd = signal.suggested_size_usdc.unwrap_or(risk_config.base_size_usd);
         let category_max = signal.category.max_single_position_usd();
-        let max_size = MAX_POSITION_USDC.min(category_max);
-
-        if size > max_size {
-            size = max_size;
-        }
-        if size < MIN_POSITION_USDC {
-            size = MIN_POSITION_USDC;
-        }
+        let size = sizer::calculate_position_size_v3(
+            target_size_usd,
+            risk_config.position_multiplier,
+            signal.confidence,
+            signal.secret_level,
+            dd_factor,
+            risk_config.min_trade_size_usdc,
+            category_max,
+        );
 
         let (open_count, market_exposure, category_exposure) = {
             let positions = self.position_manager.lock().await;
@@ -335,6 +387,33 @@ impl RiskEngine {
         *self.resume_requires_confirm.lock().await = false;
     }
 
+    pub async fn is_loss_cooldown_active(&self) -> bool {
+        self.cooldown_until
+            .lock()
+            .await
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false)
+    }
+
+    pub async fn update_portfolio_balance(&self, balance_usd: Decimal) {
+        self.balance_manager.update_balance(balance_usd);
+    }
+
+    pub async fn record_realized_outcome(&self, pnl_usd: Decimal) {
+        let mut consecutive_losses = self.consecutive_losses.lock().await;
+        let risk = self.runtime_risk.read().await;
+
+        if pnl_usd < Decimal::ZERO {
+            *consecutive_losses += 1;
+            if *consecutive_losses >= risk.max_consecutive_losses {
+                *self.cooldown_until.lock().await = Some(Instant::now() + Duration::from_secs(risk.loss_cooldown_secs));
+            }
+        } else {
+            *consecutive_losses = 0;
+            *self.cooldown_until.lock().await = None;
+        }
+    }
+
     pub async fn add_followed_wallet(&self, wallet: &str) -> Result<(), polybot_common::errors::PolybotError> {
         let normalized = wallet.trim().to_lowercase();
         if !normalized.starts_with("0x") || normalized.len() != 42 {
@@ -370,6 +449,11 @@ impl RiskEngine {
             "min_confidence" => risk.min_confidence = value.parse().map_err(|_| polybot_common::errors::PolybotError::Config("invalid integer for min_confidence".to_string()))?,
             "min_secret_level" => risk.min_secret_level = value.parse().map_err(|_| polybot_common::errors::PolybotError::Config("invalid integer for min_secret_level".to_string()))?,
             "slippage_threshold" => risk.slippage_threshold = value.parse().map_err(|_| polybot_common::errors::PolybotError::Config("invalid decimal for slippage_threshold".to_string()))?,
+            "position_multiplier" => risk.position_multiplier = value.parse().map_err(|_| polybot_common::errors::PolybotError::Config("invalid decimal for position_multiplier".to_string()))?,
+            "min_trade_size_usdc" => risk.min_trade_size_usdc = value.parse().map_err(|_| polybot_common::errors::PolybotError::Config("invalid decimal for min_trade_size_usdc".to_string()))?,
+            "min_usdc_balance" => risk.min_usdc_balance = value.parse().map_err(|_| polybot_common::errors::PolybotError::Config("invalid decimal for min_usdc_balance".to_string()))?,
+            "max_consecutive_losses" => risk.max_consecutive_losses = value.parse().map_err(|_| polybot_common::errors::PolybotError::Config("invalid integer for max_consecutive_losses".to_string()))?,
+            "loss_cooldown_secs" => risk.loss_cooldown_secs = value.parse().map_err(|_| polybot_common::errors::PolybotError::Config("invalid integer for loss_cooldown_secs".to_string()))?,
             other => {
                 return Err(polybot_common::errors::PolybotError::Config(format!(
                     "unsupported runtime config key: {}",
@@ -383,7 +467,7 @@ impl RiskEngine {
     pub async fn runtime_config_summary(&self) -> String {
         let risk = self.runtime_risk.read().await;
         format!(
-            "base_size_usd={} daily_max_loss_pct={} per_market_exposure_pct={} per_category_exposure_pct={} max_position_size_usd={} max_concurrent_positions={} min_confidence={} min_secret_level={} slippage_threshold={}",
+            "base_size_usd={} daily_max_loss_pct={} per_market_exposure_pct={} per_category_exposure_pct={} max_position_size_usd={} max_concurrent_positions={} min_confidence={} min_secret_level={} slippage_threshold={} position_multiplier={} min_trade_size_usdc={} min_usdc_balance={} max_consecutive_losses={} loss_cooldown_secs={}",
             risk.base_size_usd,
             risk.daily_max_loss_pct,
             risk.per_market_exposure_pct,
@@ -393,6 +477,11 @@ impl RiskEngine {
             risk.min_confidence,
             risk.min_secret_level,
             risk.slippage_threshold,
+            risk.position_multiplier,
+            risk.min_trade_size_usdc,
+            risk.min_usdc_balance,
+            risk.max_consecutive_losses,
+            risk.loss_cooldown_secs,
         )
     }
 }
@@ -456,4 +545,85 @@ pub async fn run_risk_engine(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::positions::PositionManager;
+    use polybot_common::types::{Category, Side};
+    use rust_decimal_macros::dec;
+
+    fn test_signal() -> Signal {
+        Signal {
+            signal_id: "signal-1".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            wallet_address: "0xabc123abc123abc123abc123abc123abc123abc1".to_string(),
+            market_id: "market-1".to_string(),
+            side: Side::Yes,
+            confidence: 6,
+            secret_level: 6,
+            category: Category::Politics,
+            source: polybot_common::types::SignalSource::Manual,
+            tx_hash: None,
+            token_id: None,
+            target_price: None,
+            target_size_usdc: None,
+            resolved: false,
+            redeemable: false,
+            suggested_size_usdc: Some(dec!(50)),
+            scanner_version: "1.0.0".to_string(),
+        }
+    }
+
+    fn engine_with_config(mut config: AppConfig) -> RiskEngine {
+        config.system.simulation = true;
+        RiskEngine::new(
+            Arc::new(config),
+            Arc::new(Metrics::new()),
+            Arc::new(Mutex::new(PositionManager::new())),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn runtime_position_multiplier_drives_live_sizing() {
+        let mut config = AppConfig::default();
+        config.risk.position_multiplier = dec!(2.0);
+        let engine = engine_with_config(config);
+
+        let decision = engine.evaluate(&test_signal()).await;
+        assert!(matches!(decision.decision, Decision::Execute));
+        assert_eq!(decision.position_size_usd, dec!(100));
+    }
+
+    #[tokio::test]
+    async fn min_usdc_balance_blocks_runtime_flow() {
+        let mut config = AppConfig::default();
+        config.risk.min_usdc_balance = dec!(200);
+        let engine = engine_with_config(config);
+        engine.update_portfolio_balance(dec!(100)).await;
+
+        let decision = engine.evaluate(&test_signal()).await;
+        assert!(matches!(decision.decision, Decision::EmergencyStop));
+        assert!(decision.blocked);
+    }
+
+    #[tokio::test]
+    async fn max_consecutive_losses_triggers_cooldown() {
+        let mut config = AppConfig::default();
+        config.risk.max_consecutive_losses = 2;
+        config.risk.loss_cooldown_secs = 60;
+        let engine = engine_with_config(config);
+
+        engine.record_realized_outcome(dec!(-1)).await;
+        engine.record_realized_outcome(dec!(-1)).await;
+
+        let decision = engine.evaluate(&test_signal()).await;
+        match decision.decision {
+            Decision::Skip(reason) => assert!(reason.contains("cooldown")),
+            other => panic!("expected cooldown skip, got {:?}", other),
+        }
+        assert!(decision.blocked);
+    }
 }

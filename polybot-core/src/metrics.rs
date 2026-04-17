@@ -267,6 +267,18 @@ mod tests {
     }
 
     #[test]
+    fn record_latency_updates_average_and_max() {
+        let m = Metrics::new();
+        m.record_latency(300);
+        m.record_latency(900);
+        assert!(m.max_latency_us.load(Ordering::Relaxed) >= 900);
+        assert!(
+            m.avg_latency_us.load(Ordering::Relaxed) >= 360,
+            "expected average latency to track the latest samples"
+        );
+    }
+
+    #[test]
     fn connection_state() {
         let m = Metrics::new();
         m.set_ws_connected(true);

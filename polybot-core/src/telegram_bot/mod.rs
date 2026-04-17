@@ -16,9 +16,38 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Mutex;
 
 use teloxide::prelude::*;
-use teloxide::utils::command::BotCommands;
+use teloxide::utils::command::{BotCommands, ParseError};
 
-#[derive(BotCommands, Clone)]
+fn parse_report_args(s: String) -> Result<(Option<String>,), ParseError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        Ok((None,))
+    } else {
+        Ok((Some(trimmed.to_string()),))
+    }
+}
+
+fn parse_mode_args(s: String) -> Result<(Option<String>,), ParseError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        Ok((None,))
+    } else {
+        Ok((Some(trimmed.to_string()),))
+    }
+}
+
+fn parse_wallet_args(s: String) -> Result<(String, Option<String>), ParseError> {
+    let args = s.split_whitespace().collect::<Vec<_>>();
+    match args.as_slice() {
+        [action] => Ok(((*action).to_string(), None)),
+        [action, address] => Ok(((*action).to_string(), Some((*address).to_string()))),
+        _ => Err(ParseError::IncorrectFormat(
+            "Usage: /wallet add <address> | /wallet remove <address> | /wallet list | /wallet score <address>".into(),
+        )),
+    }
+}
+
+#[derive(BotCommands, Clone, Debug, PartialEq)]
 #[command(rename_rule = "lowercase", description = "PolyBot v2.5 commands", parse_with = "split")]
 pub enum Command {
     #[command(description = "Show system status")]
@@ -35,10 +64,12 @@ pub enum Command {
     EmergencyStop,
     #[command(description = "Confirm destructive command")]
     Confirm,
-    #[command(description = "Show daily/weekly report")]
-    Report,
-    #[command(description = "Manage followed wallets: /wallet add <address> or /wallet remove <address>")]
-    Wallet(String, String),
+    #[command(description = "Show report: /report [daily|weekly]", parse_with = parse_report_args)]
+    Report(Option<String>),
+    #[command(description = "Manage followed wallets: /wallet add <address> or /wallet remove <address>", parse_with = parse_wallet_args)]
+    Wallet(String, Option<String>),
+    #[command(description = "Stage mode change: /mode [sim|live]", parse_with = parse_mode_args)]
+    Mode(Option<String>),
     #[command(description = "Update runtime risk config: /config <key> <value>")]
     Config(String, String),
     #[command(description = "Force full reconciliation")]
@@ -126,4 +157,40 @@ pub async fn start_telegram_bot(
     Dispatcher::builder(bot, handler).build().dispatch().await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_wallet_list_without_placeholder_argument() {
+        let parsed = Command::parse("/wallet list", "polybot").unwrap();
+        assert_eq!(parsed, Command::Wallet("list".to_string(), None));
+    }
+
+    #[test]
+    fn parse_wallet_add_with_address() {
+        let parsed = Command::parse(
+            "/wallet add 0xabc123abc123abc123abc123abc123abc123abc1",
+            "polybot",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            Command::Wallet(
+                "add".to_string(),
+                Some("0xabc123abc123abc123abc123abc123abc123abc1".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn parse_report_period_and_mode_commands() {
+        let report = Command::parse("/report weekly", "polybot").unwrap();
+        let mode = Command::parse("/mode live", "polybot").unwrap();
+
+        assert_eq!(report, Command::Report(Some("weekly".to_string())));
+        assert_eq!(mode, Command::Mode(Some("live".to_string())));
+    }
 }

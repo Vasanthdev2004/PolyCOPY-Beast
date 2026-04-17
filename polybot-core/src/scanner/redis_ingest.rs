@@ -10,13 +10,15 @@ use super::dedup::DedupFilter;
 pub struct RedisIngest {
     redis_url: String,
     stream_key: String,
+    signal_max_age_secs: u64,
 }
 
 impl RedisIngest {
-    pub fn new(redis_url: &str, stream_key: &str) -> Self {
+    pub fn new(redis_url: &str, stream_key: &str, signal_max_age_secs: u64) -> Self {
         Self {
             redis_url: redis_url.to_string(),
             stream_key: stream_key.to_string(),
+            signal_max_age_secs,
         }
     }
 
@@ -63,7 +65,7 @@ impl RedisIngest {
                                 .map(|(_, v)| v.as_str())
                                 .unwrap_or("");
 
-                            match super::schema::validate_and_create_event(signal_json) {
+                            match super::schema::validate_and_create_event_with_max_age(signal_json, self.signal_max_age_secs) {
                                 Ok(event) => {
                                     let event_id = event.signal.signal_id.clone();
 
@@ -100,6 +102,6 @@ mod tests {
 
     #[test]
     fn redis_ingest_creation() {
-        let _ingest = RedisIngest::new("redis://127.0.0.1:6379", "polybot:signals");
+        let _ingest = RedisIngest::new("redis://127.0.0.1:6379", "polybot:signals", 30);
     }
 }

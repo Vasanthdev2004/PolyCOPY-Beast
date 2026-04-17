@@ -39,6 +39,36 @@ pub fn calculate_position_size(
     size
 }
 
+pub fn calculate_position_size_v3(
+    target_size_usd: Decimal,
+    position_multiplier: Decimal,
+    confidence: u8,
+    secret_level: u8,
+    drawdown_factor: Decimal,
+    min_trade_size_usdc: Decimal,
+    category_max_usd: Decimal,
+) -> Decimal {
+    let conf = confidence_multiplier(confidence);
+    let sl = secret_level_multiplier(secret_level);
+
+    if conf == Decimal::ZERO || sl == Decimal::ZERO || drawdown_factor == Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    let mut size = target_size_usd * position_multiplier * conf * sl * drawdown_factor;
+    let max_allowed = MAX_POSITION_USDC.min(category_max_usd);
+
+    if size > max_allowed {
+        size = max_allowed;
+    }
+
+    if size < min_trade_size_usdc && size > Decimal::ZERO {
+        size = min_trade_size_usdc;
+    }
+
+    size
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +113,28 @@ mod tests {
     fn position_size_drawdown_zero_blocks() {
         let size = calculate_position_size(dec!(50), 7, 7, dec!(0.0), dec!(250));
         assert_eq!(size, dec!(0));
+    }
+
+    #[test]
+    fn v3_base_size_uses_target_size_and_position_multiplier() {
+        let size =
+            calculate_position_size_v3(dec!(75), dec!(2.0), 6, 6, dec!(1.0), dec!(1.0), dec!(250));
+
+        assert_eq!(size, dec!(150));
+    }
+
+    #[test]
+    fn v3_size_respects_min_trade_floor() {
+        let size = calculate_position_size_v3(
+            dec!(0.25),
+            dec!(1.0),
+            6,
+            6,
+            dec!(1.0),
+            dec!(1.0),
+            dec!(250),
+        );
+
+        assert_eq!(size, dec!(1.0));
     }
 }

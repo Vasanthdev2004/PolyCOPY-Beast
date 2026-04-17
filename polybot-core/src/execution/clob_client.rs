@@ -1,20 +1,162 @@
 use polybot_common::errors::PolybotError;
 use polybot_common::types::{Side, Trade};
 use polymarket_client_sdk::auth::state::{Authenticated, Unauthenticated};
-use polymarket_client_sdk::auth::{ExposeSecret, LocalSigner, Normal, Signer as _};
-use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
+use polymarket_client_sdk::auth::{Credentials as SdkCredentials, ExposeSecret, LocalSigner, Normal, Signer as _};
+use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrderBookSummaryRequest, UpdateBalanceAllowanceRequest};
 use polymarket_client_sdk::clob::types::{OrderType as SdkOrderType, Side as SdkSide, SignatureType};
 use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkClobConfig};
 use polymarket_client_sdk::types::U256;
 use polymarket_client_sdk::POLYGON;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use super::order_builder::Order;
 use super::rate_limiter::ClobRateLimiter;
+use super::retry::{RetryClass, classify_sdk_error};
+
+#[derive(Debug, Error)]
+#[error("{source}")]
+pub struct SubmitOrderError {
+    #[source]
+    source: PolybotError,
+    retry_class: RetryClass,
+}
+
+impl SubmitOrderError {
+    fn non_retryable(source: PolybotError) -> Self {
+        Self {
+            source,
+            retry_class: RetryClass::NonRetryable,
+        }
+    }
+
+    fn from_sdk_submit_error(error: polymarket_client_sdk::error::Error) -> Self {
+        let retry_class = classify_sdk_error(&error);
+        Self {
+            source: PolybotError::Execution(format!("Failed to submit CLOB order: {}", error)),
+            retry_class,
+        }
+    }
+
+    pub fn retry_class(&self) -> RetryClass {
+        self.retry_class
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(self.retry_class, RetryClass::Retryable)
+    }
+
+    pub fn into_polybot(self) -> PolybotError {
+        self.source
+    }
+}
+
+impl From<PolybotError> for SubmitOrderError {
+    fn from(source: PolybotError) -> Self {
+        Self::non_retryable(source)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletMode {
+    Eoa,
+    Proxy,
+    GnosisSafe,
+}
+
+impl std::fmt::Display for WalletMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalletMode::Eoa => write!(f, "EOA"),
+            WalletMode::Proxy => write!(f, "Proxy"),
+            WalletMode::GnosisSafe => write!(f, "GnosisSafe"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApprovalStatus {
+    pub usdc_balance: Decimal,
+    pub approved_spenders: Vec<String>,
+    pub ready_for_live_trading: bool,
+}
+
+impl ApprovalStatus {
+    pub fn guidance_message(&self) -> String {
+        format!(
+            "No positive CLOB allowances detected for this wallet. Complete the first-run USDC/CTF approval flow, then rerun `cargo run -p polybot-core -- --setup-check`. CLOB-reported USDC balance: {}",
+            self.usdc_balance
+        )
+    }
+}
+
+fn credentials_path_from_env() -> PathBuf {
+    std::env::var("POLYBOT_CLOB_CREDENTIALS_PATH")
+        .or_else(|_| std::env::var("POLYMARKET_CLOB_CREDENTIALS_PATH"))
+        .unwrap_or_else(|_| ".\\.polybot\\clob_credentials.json".to_string())
+        .into()
+}
+
+fn load_persisted_api_credentials(path: &Path) -> Result<Option<ApiCredentials>, PolybotError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        PolybotError::Config(format!(
+            "Failed to read persisted CLOB credentials from {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let credentials = serde_json::from_str(&content).map_err(|e| {
+        PolybotError::Config(format!(
+            "Failed to parse persisted CLOB credentials from {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    Ok(Some(credentials))
+}
+
+fn persist_api_credentials(path: &Path, credentials: &ApiCredentials) -> Result<(), PolybotError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            PolybotError::Config(format!(
+                "Failed to create credentials directory {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+    }
+
+    let content = serde_json::to_string_pretty(credentials).map_err(|e| {
+        PolybotError::Config(format!("Failed to serialize CLOB credentials: {}", e))
+    })?;
+
+    std::fs::write(path, content).map_err(|e| {
+        PolybotError::Config(format!(
+            "Failed to persist CLOB credentials to {}: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
+fn has_positive_allowance(value: &str) -> bool {
+    U256::from_str(value)
+        .map(|allowance| allowance > U256::ZERO)
+        .unwrap_or(false)
+}
 
 /// Configuration for the Polymarket CLOB client.
 #[derive(Debug, Clone)]
@@ -36,11 +178,25 @@ pub struct ClobConfig {
 }
 
 /// L2 API credentials derived from L1 authentication.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiCredentials {
     pub api_key: String,
     pub secret: String,
     pub passphrase: String,
+}
+
+impl ApiCredentials {
+    fn into_sdk_credentials(&self) -> Result<SdkCredentials, PolybotError> {
+        let key = Uuid::parse_str(&self.api_key).map_err(|e| {
+            PolybotError::Config(format!("Invalid persisted CLOB api key: {}", e))
+        })?;
+
+        Ok(SdkCredentials::new(
+            key,
+            self.secret.clone(),
+            self.passphrase.clone(),
+        ))
+    }
 }
 
 /// L2 API credentials alias.
@@ -155,24 +311,37 @@ impl ClobClient {
             .map_err(|_| PolybotError::Config("POLYBOT_PRIVATE_KEY not set".to_string()))?;
 
         let endpoint = std::env::var("POLYBOT_CLOB_ENDPOINT")
+            .or_else(|_| std::env::var("CLOB_API_URL"))
             .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
 
         let ws_endpoint = std::env::var("POLYBOT_WS_ENDPOINT")
+            .or_else(|_| std::env::var("WS_CLOB_URL"))
             .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com".to_string());
 
         let signature_type = std::env::var("POLYBOT_SIGNATURE_TYPE")
+            .or_else(|_| std::env::var("POLYMARKET_SIGNATURE_TYPE"))
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(0); // EOA by default
 
-        let funder_address = std::env::var("POLYBOT_FUNDER_ADDRESS").ok();
+        let funder_address = std::env::var("POLYBOT_FUNDER_ADDRESS")
+            .or_else(|_| std::env::var("FUNDER_ADDRESS"))
+            .ok();
+
+        let chain_id = std::env::var("POLYBOT_CHAIN_ID")
+            .or_else(|_| std::env::var("POLYGON_CHAIN_ID"))
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(137);
+
+        let api_key = load_persisted_api_credentials(&credentials_path_from_env())?;
 
         let config = ClobConfig {
             endpoint,
             ws_endpoint,
-            chain_id: 137, // Polygon mainnet
+            chain_id,
             private_key,
-            api_key: None,
+            api_key,
             signature_type,
             funder_address,
         };
@@ -204,8 +373,46 @@ impl ClobClient {
         tracing::info!("Authenticating with Polymarket CLOB (L1 -> L2)");
 
         let signer = self.local_signer()?;
+        let credentials_path = credentials_path_from_env();
+        let client = if let Some(credentials) = self.config.api_key.clone() {
+            match self
+                .build_authenticated_client(&signer, Some(credentials.clone()))
+                .await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        credentials_path = %credentials_path.display(),
+                        "Persisted CLOB credentials failed; deriving fresh credentials"
+                    );
+                    self.build_authenticated_client(&signer, None).await?
+                }
+            }
+        } else {
+            self.build_authenticated_client(&signer, None).await?
+        };
 
-        let mut builder = self.public_client.clone().authentication_builder(&signer);
+        let credentials = client.credentials().clone();
+        *self.authenticated_client.write().await = Some(client);
+        *self.authenticated.write().await = true;
+        let api_credentials = ApiCredentials {
+            api_key: credentials.key().to_string(),
+            secret: credentials.secret().expose_secret().to_string(),
+            passphrase: credentials.passphrase().expose_secret().to_string(),
+        };
+
+        persist_api_credentials(&credentials_path, &api_credentials)?;
+
+        Ok(api_credentials)
+    }
+
+    async fn build_authenticated_client(
+        &self,
+        signer: &impl polymarket_client_sdk::auth::Signer,
+        credentials: Option<ApiCredentials>,
+    ) -> Result<SdkClobClient<Authenticated<Normal>>, PolybotError> {
+        let mut builder = self.public_client.clone().authentication_builder(signer);
         builder = builder.signature_type(self.sdk_signature_type());
 
         if let Some(funder) = self.config.funder_address.as_ref() {
@@ -215,19 +422,14 @@ impl ClobClient {
             builder = builder.funder(funder);
         }
 
-        let client = builder
+        if let Some(credentials) = credentials {
+            builder = builder.credentials(credentials.into_sdk_credentials()?);
+        }
+
+        builder
             .authenticate()
             .await
-            .map_err(|e| PolybotError::Execution(format!("CLOB authentication failed: {}", e)))?;
-
-        let credentials = client.credentials().clone();
-        *self.authenticated_client.write().await = Some(client);
-        *self.authenticated.write().await = true;
-        Ok(ApiCredentials {
-            api_key: credentials.key().to_string(),
-            secret: credentials.secret().expose_secret().to_string(),
-            passphrase: credentials.passphrase().expose_secret().to_string(),
-        })
+            .map_err(|e| PolybotError::Execution(format!("CLOB authentication failed: {}", e)))
     }
 
     fn sdk_signature_type(&self) -> SignatureType {
@@ -235,6 +437,51 @@ impl ClobClient {
             1 => SignatureType::Proxy,
             2 => SignatureType::GnosisSafe,
             _ => SignatureType::Eoa,
+        }
+    }
+
+    pub fn validate_wallet_mode(&self) -> Result<WalletMode, PolybotError> {
+        if self.config.chain_id != POLYGON {
+            return Err(PolybotError::Config(format!(
+                "Unsupported chain id {}. Module 0 requires Polygon mainnet (137).",
+                self.config.chain_id
+            )));
+        }
+
+        self.local_signer()?;
+
+        match self.config.signature_type {
+            0 => {
+                if self.config.funder_address.is_some() {
+                    return Err(PolybotError::Config(
+                        "POLYBOT_FUNDER_ADDRESS must not be set for EOA mode".to_string(),
+                    ));
+                }
+                Ok(WalletMode::Eoa)
+            }
+            1 => {
+                if let Some(funder) = self.config.funder_address.as_ref() {
+                    let _: polymarket_client_sdk::types::Address = funder.parse().map_err(|e| {
+                        PolybotError::Config(format!("Invalid proxy funder address: {}", e))
+                    })?;
+                }
+                Ok(WalletMode::Proxy)
+            }
+            2 => {
+                let funder = self.config.funder_address.as_ref().ok_or_else(|| {
+                    PolybotError::Config(
+                        "POLYBOT_FUNDER_ADDRESS is required for GnosisSafe mode".to_string(),
+                    )
+                })?;
+                let _: polymarket_client_sdk::types::Address = funder.parse().map_err(|e| {
+                    PolybotError::Config(format!("Invalid GnosisSafe funder address: {}", e))
+                })?;
+                Ok(WalletMode::GnosisSafe)
+            }
+            other => Err(PolybotError::Config(format!(
+                "Unsupported POLYBOT_SIGNATURE_TYPE {}. Expected 0 (EOA), 1 (Proxy), or 2 (GnosisSafe).",
+                other
+            ))),
         }
     }
 
@@ -246,18 +493,67 @@ impl ClobClient {
         }
 
         LocalSigner::from_str(&self.config.private_key)
-            .map(|signer| signer.with_chain_id(Some(POLYGON)))
+            .map(|signer| signer.with_chain_id(Some(self.config.chain_id)))
             .map_err(|e| PolybotError::Config(format!("Invalid private key: {}", e)))
+    }
+
+    pub async fn check_approvals(&self) -> Result<ApprovalStatus, PolybotError> {
+        if !*self.authenticated.read().await {
+            self.authenticate().await?;
+        }
+
+        let client = self
+            .authenticated_client
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                PolybotError::Execution("Authenticated CLOB client unavailable".to_string())
+            })?;
+
+        client
+            .update_balance_allowance(UpdateBalanceAllowanceRequest::default())
+            .await
+            .map_err(|e| {
+                PolybotError::Execution(format!(
+                    "Failed to refresh CLOB approval state: {}",
+                    e
+                ))
+            })?;
+
+        let response = client
+            .balance_allowance(BalanceAllowanceRequest::default())
+            .await
+            .map_err(|e| {
+                PolybotError::Execution(format!(
+                    "Failed to read CLOB balance/allowance state: {}",
+                    e
+                ))
+            })?;
+
+        let approved_spenders = response
+            .allowances
+            .iter()
+            .filter(|(_, allowance)| has_positive_allowance(allowance))
+            .map(|(address, _)| address.to_string())
+            .collect::<Vec<_>>();
+
+        Ok(ApprovalStatus {
+            usdc_balance: response.balance,
+            ready_for_live_trading: !approved_spenders.is_empty(),
+            approved_spenders,
+        })
     }
 
     /// Submit a signed order to the CLOB.
     /// This is the main entry point for live trading.
-    pub async fn submit_order(&self, order: &Order) -> Result<Trade, PolybotError> {
+    pub async fn submit_order(&self, order: &Order) -> Result<Trade, SubmitOrderError> {
         // Check rate limiter
         if !self.rate_limiter.check_write().await {
-            return Err(PolybotError::Execution(
+            return Err(SubmitOrderError::non_retryable(PolybotError::Execution(
                 "CLOB rate limit circuit breaker is open — too many requests".to_string(),
-            ));
+            )));
         }
         self.rate_limiter.record_write().await;
 
@@ -275,7 +571,7 @@ impl ClobClient {
         );
 
         if !*self.authenticated.read().await {
-            self.authenticate().await?;
+            self.authenticate().await.map_err(SubmitOrderError::from)?;
         }
 
         let client = self
@@ -314,7 +610,7 @@ impl ClobClient {
         let response = client
             .post_order(signed_order)
             .await
-            .map_err(|e| PolybotError::Execution(format!("Failed to submit CLOB order: {}", e)))?;
+            .map_err(SubmitOrderError::from_sdk_submit_error)?;
 
         let status = if !response.success {
             polybot_common::types::TradeStatus::Failed(
@@ -619,6 +915,7 @@ impl ClobClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn test_config() -> ClobConfig {
         ClobConfig {
@@ -631,6 +928,10 @@ mod tests {
             signature_type: 0,
             funder_address: None,
         }
+    }
+
+    fn temp_credentials_path() -> PathBuf {
+        std::env::temp_dir().join(format!("polybot-clob-credentials-{}.json", Uuid::new_v4()))
     }
 
     #[test]
@@ -769,5 +1070,75 @@ mod tests {
         assert_eq!(ctx.tick_size, dec!(0.001));
         assert_eq!(ctx.min_order_size, dec!(5));
         assert!(ctx.neg_risk);
+    }
+
+    #[test]
+    fn wallet_mode_validation_rejects_funder_in_eoa_mode() {
+        let mut config = test_config();
+        config.funder_address = Some("0xabc123abc123abc123abc123abc123abc123abc1".to_string());
+        let client = ClobClient::new(config);
+
+        assert!(client.validate_wallet_mode().is_err());
+    }
+
+    #[test]
+    fn wallet_mode_validation_requires_funder_for_safe_mode() {
+        let mut config = test_config();
+        config.signature_type = 2;
+        let client = ClobClient::new(config);
+
+        assert!(client.validate_wallet_mode().is_err());
+    }
+
+    #[test]
+    fn persisted_credentials_round_trip() {
+        let path = temp_credentials_path();
+        let credentials = ApiCredentials {
+            api_key: Uuid::new_v4().to_string(),
+            secret: "secret".to_string(),
+            passphrase: "passphrase".to_string(),
+        };
+
+        persist_api_credentials(&path, &credentials).unwrap();
+        let loaded = load_persisted_api_credentials(&path).unwrap();
+
+        assert_eq!(loaded, Some(credentials));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn approval_guidance_mentions_setup_check() {
+        let status = ApprovalStatus {
+            usdc_balance: Decimal::ZERO,
+            approved_spenders: vec![],
+            ready_for_live_trading: false,
+        };
+
+        assert!(status.guidance_message().contains("--setup-check"));
+    }
+
+    #[test]
+    fn submit_order_error_marks_429_as_retryable() {
+        let error = SubmitOrderError::from_sdk_submit_error(polymarket_client_sdk::error::Error::status(
+            polymarket_client_sdk::error::StatusCode::TOO_MANY_REQUESTS,
+            polymarket_client_sdk::error::Method::POST,
+            "/order".to_string(),
+            "rate limited",
+        ));
+
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn submit_order_error_marks_400_as_non_retryable() {
+        let error = SubmitOrderError::from_sdk_submit_error(polymarket_client_sdk::error::Error::status(
+            polymarket_client_sdk::error::StatusCode::BAD_REQUEST,
+            polymarket_client_sdk::error::Method::POST,
+            "/order".to_string(),
+            "bad order",
+        ));
+
+        assert!(!error.is_retryable());
     }
 }

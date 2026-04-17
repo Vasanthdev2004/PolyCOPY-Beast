@@ -2,11 +2,12 @@ pub mod clob_client;
 pub mod clob_ws;
 pub mod order_builder;
 pub mod rate_limiter;
+pub mod retry;
 pub mod rpc_pool;
 
 use polybot_common::constants::MIN_POSITION_USDC;
 use polybot_common::errors::PolybotError;
-use polybot_common::types::{Decision, RiskDecision, Trade};
+use polybot_common::types::{Decision, OrderType, RiskDecision, Trade};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ pub async fn run_execution_engine(
     state_sender: mpsc::Sender<Trade>,
 ) -> Result<(), PolybotError> {
     let _rpc_pool = rpc_pool::RpcPool::new(&config.execution.rpc_endpoints);
+    let retry_policy = retry::RetryPolicy::default();
     let market_data_client = clob_client::ClobClient::public_readonly();
     let ws_manager = Arc::new(clob_ws::ClobWsManager::new(
         clob_client::ClobConfig {
@@ -219,8 +221,14 @@ pub async fn run_execution_engine(
                     continue;
                 }
 
-                let order =
-                    order_builder::build_order(&decision, &market_context, target_price, size_usd);
+                let order = order_builder::build_order_with_price_buffer(
+                    &decision,
+                    &market_context,
+                    target_price,
+                    size_usd,
+                    config.execution.price_buffer,
+                    OrderType::Fok,
+                );
 
                 if config.system.simulation || clob_client.is_none() {
                     tracing::info!(signal_id = %decision.signal_id, "Simulation mode: creating simulated trade");
@@ -237,29 +245,52 @@ pub async fn run_execution_engine(
                         return Err(PolybotError::ChannelClosed);
                     }
                 } else if let Some(ref client) = clob_client {
-                    match client.submit_order(&order).await {
-                        Ok(trade) => {
-                            metrics.record_trade(false);
-                            if let Some(alerts) = &alerts {
-                                alerts.info(format!(
-                                    "Live trade executed: signal={} market={} size_usd={} price={}",
-                                    decision.signal_id, decision.market_id, trade.size_usd, trade.price
-                                ));
+                    let mut attempt = 0u32;
+                    loop {
+                        match client.submit_order(&order).await {
+                            Ok(trade) => {
+                                metrics.record_trade(false);
+                                if let Some(alerts) = &alerts {
+                                    alerts.info(format!(
+                                        "Live trade executed: signal={} market={} size_usd={} price={}",
+                                        decision.signal_id, decision.market_id, trade.size_usd, trade.price
+                                    ));
+                                }
+                                if state_sender.send(trade).await.is_err() {
+                                    tracing::error!("State channel closed");
+                                    return Err(PolybotError::ChannelClosed);
+                                }
+                                break;
                             }
-                            if state_sender.send(trade).await.is_err() {
-                                tracing::error!("State channel closed");
-                                return Err(PolybotError::ChannelClosed);
+                            Err(err) => {
+                                let retry_class = err.retry_class();
+                                if retry_policy.should_retry(attempt, retry_class) {
+                                    let delay = retry_policy.backoff_delay(attempt);
+                                    tracing::warn!(
+                                        signal_id = %decision.signal_id,
+                                        market_id = %decision.market_id,
+                                        attempt = attempt + 1,
+                                        delay_ms = delay.as_millis(),
+                                        retry_class = ?retry_class,
+                                        error = %err,
+                                        "Retryable order submission failure, backing off"
+                                    );
+                                    attempt += 1;
+                                    tokio::time::sleep(delay).await;
+                                    continue;
+                                }
+
+                                let error = err.into_polybot();
+                                metrics.record_trade_failed();
+                                if let Some(alerts) = &alerts {
+                                    alerts.critical(format!(
+                                        "Order submission failed for signal {} market {}: {}",
+                                        decision.signal_id, decision.market_id, error
+                                    ));
+                                }
+                                tracing::error!(error = %error, "Order submission failed");
+                                break;
                             }
-                        }
-                        Err(e) => {
-                            metrics.record_trade_failed();
-                            if let Some(alerts) = &alerts {
-                                alerts.critical(format!(
-                                    "Order submission failed for signal {} market {}: {}",
-                                    decision.signal_id, decision.market_id, e
-                                ));
-                            }
-                            tracing::error!(error = %e, "Order submission failed");
                         }
                     }
                 }

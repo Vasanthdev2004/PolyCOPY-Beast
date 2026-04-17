@@ -6,6 +6,7 @@ mod health;
 mod metrics;
 mod risk;
 mod scanner;
+mod setup;
 mod state;
 mod telegram_bot;
 
@@ -34,10 +35,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = AppConfig::load()?;
     config.apply_env_overrides();
 
+    let setup_only = std::env::args().any(|arg| arg == "--setup-check");
+    let preflight = setup::run_startup_preflight(&config).await?;
+
     tracing::info!(
         simulation = config.system.simulation,
-        "SuperFast PolyBot v2.5 starting"
+        preflight = %preflight.summary(),
+        "SuperFast PolyBot v3 starting"
     );
+
+    if setup_only {
+        tracing::info!("Startup preflight completed successfully; exiting because --setup-check was requested");
+        return Ok(());
+    }
 
     if config.system.simulation {
         tracing::info!("Running in SIMULATION mode — no real orders will be placed");
@@ -53,17 +63,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let position_manager = Arc::new(tokio::sync::Mutex::new(
         state::positions::PositionManager::new(),
     ));
+
+    if let Ok(store) = state::sqlite::SqliteStore::open(std::path::Path::new(&sqlite_path)) {
+        if let Err(e) = state::recover_from_sqlite(&store, metrics.clone(), position_manager.clone()).await {
+            tracing::error!(error = %e, "Failed to recover state from SQLite");
+        }
+    }
+
     let risk_engine = Arc::new(risk::RiskEngine::new(
         config.clone(),
         metrics.clone(),
         position_manager.clone(),
         Some(alert_broadcaster.clone()),
     ));
+
+    if let Ok(store) = state::sqlite::SqliteStore::open(std::path::Path::new(&sqlite_path)) {
+        if let Ok(targets) = store.list_active_targets() {
+            for target in targets {
+                let _ = risk_engine.add_followed_wallet(&target.wallet_address).await;
+            }
+        }
+
+        for wallet in risk_engine.list_followed_wallets().await {
+            if let Err(e) = store.upsert_target(
+                &wallet,
+                None,
+                &config.scanner.target_categories,
+                None,
+            ) {
+                tracing::error!(error = %e, wallet = %wallet, "Failed to persist followed wallet to SQLite targets table");
+            }
+        }
+    }
+
     let reconciler = Arc::new(state::reconciliation::Reconciler::new(
         position_manager.clone(),
         Some(config.redis.url.clone()),
-    ));
+    ).with_alerts(Some(alert_broadcaster.clone())));
     let market_prices = Arc::new(RwLock::new(HashMap::new()));
+    let wallet_activity_state = Arc::new(RwLock::new(scanner::wallet_tracker::WalletActivityState::default()));
 
     // Create channels
     // Scanner -> Dedup -> Risk -> Execution -> State
@@ -71,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (dedup_signal_tx, dedup_signal_rx) = mpsc::channel(256);
     let (risk_decision_tx, risk_decision_rx) = mpsc::channel(128);
     let (trade_tx, trade_rx) = mpsc::channel(128);
+    let (wallet_trigger_tx, wallet_trigger_rx) = mpsc::channel(256);
 
     // Health state — now backed by shared Metrics
     let health_state = Arc::new(health::HealthState {
@@ -80,6 +119,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics: metrics.clone(),
         redis_url: config.redis.url.clone(),
         sqlite_path: sqlite_path.clone(),
+        starting_balance: if config.risk.base_size_pct > rust_decimal::Decimal::ZERO {
+            config.risk.base_size_usd / config.risk.base_size_pct
+        } else {
+            config.risk.base_size_usd
+        },
+        risk_engine: risk_engine.clone(),
+        position_manager: position_manager.clone(),
     });
 
     // Spawn dedup filter task
@@ -93,6 +139,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let _ = dedup_metrics; // available for future dedup metrics
+
+    // Spawn Data API polling scanner (Module 2 primary source)
+    let poller_config = config.clone();
+    let poller_risk = risk_engine.clone();
+    let poller_signal_tx = raw_signal_tx.clone();
+    let poller_state = wallet_activity_state.clone();
+    let poller_handle = tokio::spawn(async move {
+        match scanner::data_api::DataApiPoller::new(&poller_config, poller_state) {
+            Ok(poller) => {
+                if let Err(e) = poller.run(poller_risk, poller_signal_tx, wallet_trigger_rx).await {
+                    tracing::error!(error = %e, "Data API poller failed");
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "Failed to initialize Data API poller"),
+        }
+    });
+
+    // Spawn market WebSocket fast-path trigger loop (Module 2 secondary source)
+    let fast_path_handle = if config.scanner.use_websocket {
+        let ws_config = config.clone();
+        let ws_state = wallet_activity_state.clone();
+        Some(tokio::spawn(async move {
+            let fast_path = scanner::market_ws::MarketFastPath::new(&ws_config, ws_state);
+            if let Err(e) = fast_path.run(wallet_trigger_tx).await {
+                tracing::error!(error = %e, "Market fast-path failed");
+            }
+        }))
+    } else {
+        None
+    };
 
     // Spawn risk engine task
     let risk_engine_task = risk_engine.clone();
@@ -172,10 +248,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn Redis stream ingestion
     let redis_signal_tx = raw_signal_tx.clone();
     let redis_url = config.redis.url.clone();
+    let redis_signal_max_age_secs = config.scanner.signal_max_age_secs;
     let redis_ingest_handle = tokio::spawn(async move {
         let stream_key = std::env::var("POLYBOT_SIGNAL_STREAM")
             .unwrap_or_else(|_| "polybot:signals".to_string());
-        let redis_ingest = scanner::redis_ingest::RedisIngest::new(&redis_url, &stream_key);
+        let redis_ingest = scanner::redis_ingest::RedisIngest::new(
+            &redis_url,
+            &stream_key,
+            redis_signal_max_age_secs,
+        );
         if let Err(e) = redis_ingest.run(redis_signal_tx).await {
             tracing::error!(error = %e, "Redis ingest failed");
         }
@@ -240,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for all tasks
     let _ = tokio::join!(
         dedup_handle,
+        poller_handle,
         risk_handle,
         exec_handle,
         state_handle,
@@ -251,6 +333,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tg_handle,
         fw_handle,
     );
+
+    if let Some(handle) = fast_path_handle {
+        let _ = handle.await;
+    }
 
     Ok(())
 }

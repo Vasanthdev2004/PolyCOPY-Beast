@@ -6,7 +6,7 @@ pub mod redis_store;
 pub mod sqlite;
 
 use polybot_common::errors::PolybotError;
-use polybot_common::types::{Category, OrderType, PositionKey, Side, Trade, TradeStatus};
+use polybot_common::types::{PositionKey, Trade, TradeStatus};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -15,6 +15,69 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::config::AppConfig;
 use crate::metrics::Metrics;
+
+pub async fn recover_from_sqlite(
+    store: &sqlite::SqliteStore,
+    metrics: Arc<Metrics>,
+    position_manager: Arc<Mutex<positions::PositionManager>>,
+) -> Result<(), PolybotError> {
+    let rows = store.list_open_positions()?;
+    let positions = rows.into_iter().map(|row| row.position).collect::<Vec<_>>();
+    let count = positions.len() as u32;
+
+    position_manager.lock().await.restore_positions(positions);
+    metrics.set_open_positions(count);
+
+    Ok(())
+}
+
+fn initial_starting_balance(config: &AppConfig) -> Decimal {
+    if config.risk.base_size_pct > Decimal::ZERO {
+        config.risk.base_size_usd / config.risk.base_size_pct
+    } else {
+        config.risk.base_size_usd
+    }
+}
+
+fn update_daily_stats(
+    store: &sqlite::SqliteStore,
+    config: &AppConfig,
+    metrics: &Metrics,
+    trade: &Trade,
+    unrealized: Decimal,
+) -> Result<(), PolybotError> {
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let mut stats = store.get_daily_stats(&date)?.unwrap_or(sqlite::DailyStatsRow {
+        date: date.clone(),
+        starting_balance: initial_starting_balance(config),
+        realized_pnl: Decimal::ZERO,
+        unrealized_pnl: Decimal::ZERO,
+        volume_traded: Decimal::ZERO,
+        trades_placed: 0,
+        trades_filled: 0,
+        trades_rejected: 0,
+        drawdown_pct: Decimal::ZERO,
+        paused_at: None,
+        notes: None,
+    });
+
+    stats.unrealized_pnl = unrealized;
+    stats.volume_traded += trade.size_usd;
+    stats.trades_placed += 1;
+    match trade.status {
+        TradeStatus::Filled | TradeStatus::PartiallyFilled => stats.trades_filled += 1,
+        TradeStatus::Cancelled | TradeStatus::TimedOut | TradeStatus::Failed(_) => {
+            stats.trades_rejected += 1
+        }
+        TradeStatus::Pending => {}
+    }
+
+    let current_value = stats.starting_balance + stats.realized_pnl + stats.unrealized_pnl;
+    stats.drawdown_pct = pnl::calculate_drawdown_pct(current_value, stats.starting_balance);
+
+    metrics.update_drawdown(stats.drawdown_pct.to_f64().unwrap_or(0.0));
+    store.upsert_daily_stats(&stats)
+}
 
 pub async fn force_flatten_positions(
     redis_url: Option<&str>,
@@ -69,13 +132,14 @@ pub async fn run_state_manager(
                 market_prices,
                 &store,
                 sqlite_path.as_deref(),
+                &config,
             )
             .await
         }
         Err(e) => {
             tracing::warn!("Redis unavailable ({}), running in memory-only mode", e);
             metrics.set_redis_connected(false);
-            run_in_memory(receiver, metrics, position_manager, market_prices, sqlite_path.as_deref()).await
+            run_in_memory(receiver, metrics, position_manager, market_prices, sqlite_path.as_deref(), &config).await
         }
     }
 }
@@ -87,6 +151,7 @@ async fn run_with_redis(
     market_prices: Arc<RwLock<HashMap<String, Decimal>>>,
     redis_store: &redis_store::RedisStore,
     sqlite_path: Option<&str>,
+    config: &AppConfig,
 ) -> Result<(), PolybotError> {
     while let Some(trade) = receiver.recv().await {
         tracing::info!(
@@ -103,14 +168,19 @@ async fn run_with_redis(
         }
 
         if let Some(sqlite_path) = sqlite_path {
-            if let Err(e) = sqlite::SqliteStore::open(std::path::Path::new(sqlite_path))
-                .and_then(|store| store.insert_trade(&trade))
-            {
-                tracing::error!(error = %e, "Failed to persist trade to SQLite");
+            let store = sqlite::SqliteStore::open(std::path::Path::new(sqlite_path));
+            if let Ok(store) = store {
+                if let Err(e) = store.insert_trade(&trade) {
+                    tracing::error!(error = %e, "Failed to persist trade to SQLite");
+                }
+            } else if let Err(e) = store {
+                tracing::error!(error = %e, "Failed to open SQLite for trade persistence");
             }
         }
 
-        let (position_snapshot, open_positions, unrealized) = {
+        let sqlite_store = sqlite_path.and_then(|path| sqlite::SqliteStore::open(std::path::Path::new(path)).ok());
+
+        let (position_snapshot, current_price, open_positions, unrealized) = {
             let mut position_manager = position_manager.lock().await;
             if let Err(e) = position_manager.update_from_trade(&trade) {
                 tracing::error!(error = %e, "Failed to update position from trade");
@@ -121,6 +191,7 @@ async fn run_with_redis(
                 position_manager
                     .get_position(&PositionKey::new(trade.market_id.clone(), trade.side))
                     .cloned(),
+                current_prices.get(&trade.market_id).copied(),
                 position_manager.open_position_count(),
                 pnl::calculate_unrealized_pnl(&position_manager, &current_prices),
             )
@@ -130,6 +201,22 @@ async fn run_with_redis(
         if let Some(pos) = position_snapshot.as_ref() {
             if let Err(e) = redis_store.store_position(pos).await {
                 tracing::error!(error = %e, "Failed to persist position to Redis");
+            }
+
+            if let Some(store) = sqlite_store.as_ref() {
+                let owner = match store.lookup_signal_wallet(&trade.signal_id) {
+                    Ok(owner) => owner,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to lookup signal owner for SQLite position persistence");
+                        None
+                    }
+                };
+                if let Err(e) = store.upsert_position(pos, current_price, Some(unrealized), owner.as_deref()) {
+                    tracing::error!(error = %e, "Failed to persist position to SQLite");
+                }
+                if let Err(e) = update_daily_stats(store, config, &metrics, &trade, unrealized) {
+                    tracing::error!(error = %e, "Failed to update SQLite daily stats");
+                }
             }
         }
 
@@ -148,6 +235,7 @@ async fn run_in_memory(
     position_manager: Arc<Mutex<positions::PositionManager>>,
     market_prices: Arc<RwLock<HashMap<String, Decimal>>>,
     sqlite_path: Option<&str>,
+    config: &AppConfig,
 ) -> Result<(), PolybotError> {
     while let Some(trade) = receiver.recv().await {
         tracing::info!(
@@ -159,14 +247,19 @@ async fn run_in_memory(
         );
 
         if let Some(sqlite_path) = sqlite_path {
-            if let Err(e) = sqlite::SqliteStore::open(std::path::Path::new(sqlite_path))
-                .and_then(|store| store.insert_trade(&trade))
-            {
-                tracing::error!(error = %e, "Failed to persist trade to SQLite");
+            match sqlite::SqliteStore::open(std::path::Path::new(sqlite_path)) {
+                Ok(store) => {
+                    if let Err(e) = store.insert_trade(&trade) {
+                        tracing::error!(error = %e, "Failed to persist trade to SQLite");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "Failed to open SQLite for trade persistence"),
             }
         }
 
-        let (open_positions, unrealized) = {
+        let sqlite_store = sqlite_path.and_then(|path| sqlite::SqliteStore::open(std::path::Path::new(path)).ok());
+
+        let (position_snapshot, current_price, open_positions, unrealized) = {
             let mut position_manager = position_manager.lock().await;
             if let Err(e) = position_manager.update_from_trade(&trade) {
                 tracing::error!(error = %e, "Failed to update position from trade");
@@ -174,10 +267,30 @@ async fn run_in_memory(
 
             let current_prices_in_memory = market_prices.read().await.clone();
             (
+                position_manager
+                    .get_position(&PositionKey::new(trade.market_id.clone(), trade.side))
+                    .cloned(),
+                current_prices_in_memory.get(&trade.market_id).copied(),
                 position_manager.open_position_count(),
                 pnl::calculate_unrealized_pnl(&position_manager, &current_prices_in_memory),
             )
         };
+
+        if let (Some(store), Some(pos)) = (sqlite_store.as_ref(), position_snapshot.as_ref()) {
+            let owner = match store.lookup_signal_wallet(&trade.signal_id) {
+                Ok(owner) => owner,
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to lookup signal owner for SQLite position persistence");
+                    None
+                }
+            };
+            if let Err(e) = store.upsert_position(pos, current_price, Some(unrealized), owner.as_deref()) {
+                tracing::error!(error = %e, "Failed to persist position to SQLite");
+            }
+            if let Err(e) = update_daily_stats(store, config, &metrics, &trade, unrealized) {
+                tracing::error!(error = %e, "Failed to update SQLite daily stats");
+            }
+        }
 
         metrics.set_open_positions(open_positions);
         metrics.update_daily_pnl(unrealized.to_f64().unwrap_or(0.0));
@@ -192,6 +305,7 @@ async fn run_in_memory(
 mod tests {
     use super::*;
     use chrono::Utc;
+    use polybot_common::types::{Category, OrderType, Side};
 
     fn test_trade(market_id: &str, side: Side, category: Category) -> Trade {
         Trade {
@@ -240,5 +354,87 @@ mod tests {
             2
         );
         assert_eq!(position_manager.lock().await.open_position_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn recover_from_sqlite_restores_positions_and_metrics() {
+        let store = sqlite::SqliteStore::open_in_memory().unwrap();
+        let position = polybot_common::types::Position {
+            id: "pos-1".to_string(),
+            market_id: "market-1".to_string(),
+            side: Side::Yes,
+            entry_price: Decimal::new(60, 2),
+            current_size: Decimal::new(10, 0),
+            average_price: Decimal::new(60, 2),
+            opened_at: Utc::now(),
+            status: polybot_common::types::PositionStatus::Open,
+            category: Category::Politics,
+        };
+        store
+            .upsert_position(&position, Some(Decimal::new(65, 2)), Some(Decimal::new(5, 0)), Some("0xabc"))
+            .unwrap();
+
+        let metrics = Arc::new(Metrics::new());
+        let position_manager = Arc::new(Mutex::new(positions::PositionManager::new()));
+
+        recover_from_sqlite(&store, metrics.clone(), position_manager.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(position_manager.lock().await.open_position_count(), 1);
+        assert_eq!(metrics.open_positions.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn run_in_memory_persists_positions_and_daily_stats_to_sqlite() {
+        let sqlite_path = std::env::temp_dir().join(format!("polybot-state-{}.db", uuid::Uuid::new_v4()));
+        std::env::set_var("POLYBOT_SQLITE_PATH", &sqlite_path);
+
+        let store = sqlite::SqliteStore::open(&sqlite_path).unwrap();
+        store.insert_signal_log(
+            "signal-1",
+            &Utc::now().to_rfc3339(),
+            "0xabc123abc123abc123abc123abc123abc123abc1",
+            "m1",
+            7,
+            7,
+            "politics",
+            "YES",
+            "execute",
+        ).unwrap();
+
+        let metrics = Arc::new(Metrics::new());
+        let position_manager = Arc::new(Mutex::new(positions::PositionManager::new()));
+        let market_prices = Arc::new(RwLock::new(HashMap::from([("m1".to_string(), Decimal::new(70, 2))])));
+        let (tx, rx) = mpsc::channel(4);
+        let config = AppConfig::default();
+
+        tx.send(test_trade("m1", Side::Yes, Category::Politics)).await.unwrap();
+        drop(tx);
+
+        run_in_memory(
+            rx,
+            metrics,
+            position_manager,
+            market_prices,
+            Some(sqlite_path.to_string_lossy().as_ref()),
+            &config,
+        )
+            .await
+            .unwrap();
+
+        let reopened = sqlite::SqliteStore::open(&sqlite_path).unwrap();
+        let positions = reopened.list_open_positions().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].owned_by_wallet.as_deref(), Some("0xabc123abc123abc123abc123abc123abc123abc1"));
+
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let stats = reopened.get_daily_stats(&today).unwrap().unwrap();
+        assert_eq!(stats.trades_placed, 1);
+        assert_eq!(stats.trades_filled, 1);
+        assert_eq!(stats.volume_traded, Decimal::new(500, 2));
+
+        let _ = std::fs::remove_file(sqlite_path);
+        std::env::remove_var("POLYBOT_SQLITE_PATH");
     }
 }

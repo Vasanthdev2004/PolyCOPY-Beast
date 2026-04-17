@@ -4,13 +4,14 @@ use tokio::sync::mpsc;
 use tracing;
 
 use crate::config::AppConfig;
-use crate::scanner::schema::validate_and_create_event;
+use crate::scanner::schema::validate_and_create_event_with_max_age;
 use polybot_common::errors::PolybotError;
 use polybot_common::types::ScannerEvent;
 
 pub struct FileWatcher {
     watch_dir: PathBuf,
     processed_dir: PathBuf,
+    signal_max_age_secs: u64,
     sender: mpsc::Sender<ScannerEvent>,
 }
 
@@ -19,6 +20,7 @@ impl FileWatcher {
         Self {
             watch_dir: PathBuf::from(&config.scanner.watch_dir),
             processed_dir: PathBuf::from(&config.scanner.processed_dir),
+            signal_max_age_secs: config.scanner.signal_max_age_secs,
             sender,
         }
     }
@@ -89,7 +91,7 @@ impl FileWatcher {
         let content = std::fs::read_to_string(path)
             .map_err(|e| PolybotError::Scanner(format!("Failed to read file {:?}: {}", path, e)))?;
 
-        let event = validate_and_create_event(&content)?;
+        let event = validate_and_create_event_with_max_age(&content, self.signal_max_age_secs)?;
         self.sender
             .send(event)
             .await

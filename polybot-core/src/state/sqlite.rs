@@ -1,7 +1,9 @@
 use polybot_common::errors::PolybotError;
-use polybot_common::types::Trade;
+use polybot_common::types::{Category, Position, PositionStatus, Side, Trade};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::str::FromStr as _;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalLogEntry {
@@ -15,6 +17,52 @@ pub struct SignalLogEntry {
     pub side: String,
     pub disposition: String,
     pub received_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedPositionRow {
+    pub position: Position,
+    pub current_price: Option<Decimal>,
+    pub unrealized_pnl: Option<Decimal>,
+    pub owned_by_wallet: Option<String>,
+    pub last_updated: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DailyStatsRow {
+    pub date: String,
+    pub starting_balance: Decimal,
+    pub realized_pnl: Decimal,
+    pub unrealized_pnl: Decimal,
+    pub volume_traded: Decimal,
+    pub trades_placed: u32,
+    pub trades_filled: u32,
+    pub trades_rejected: u32,
+    pub drawdown_pct: Decimal,
+    pub paused_at: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TargetRow {
+    pub wallet_address: String,
+    pub label: Option<String>,
+    pub categories: Vec<Category>,
+    pub score: Option<Decimal>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecentTradeRow {
+    pub id: String,
+    pub signal_id: String,
+    pub market_id: String,
+    pub category: String,
+    pub side: String,
+    pub status: String,
+    pub size_usd: Decimal,
+    pub placed_at: String,
+    pub simulated: bool,
 }
 
 /// v2.5: SQLite cold persistence for trade history and audit trail.
@@ -42,10 +90,15 @@ impl SqliteStore {
     fn create_tables(&self) -> Result<(), PolybotError> {
         self.conn
             .execute_batch(
-                "CREATE TABLE IF NOT EXISTS trades (
+                "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS trades (
                 id TEXT PRIMARY KEY,
                 signal_id TEXT NOT NULL,
                 market_id TEXT NOT NULL,
+                category TEXT,
                 side TEXT NOT NULL,
                 price TEXT NOT NULL,
                 size TEXT NOT NULL,
@@ -66,7 +119,11 @@ impl SqliteStore {
                 average_price TEXT NOT NULL,
                 opened_at TEXT NOT NULL,
                 status TEXT NOT NULL,
-                category TEXT NOT NULL
+                category TEXT NOT NULL,
+                current_price TEXT,
+                unrealized_pnl TEXT,
+                owned_by_wallet TEXT,
+                last_updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS signal_log (
                 signal_id TEXT PRIMARY KEY,
@@ -79,7 +136,34 @@ impl SqliteStore {
                 side TEXT NOT NULL,
                 disposition TEXT NOT NULL,
                 received_at TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS targets (
+                wallet_address TEXT PRIMARY KEY,
+                label TEXT,
+                added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                active INTEGER NOT NULL DEFAULT 1,
+                categories TEXT NOT NULL DEFAULT '[]',
+                score TEXT,
+                notes TEXT
+            );
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                date TEXT PRIMARY KEY,
+                starting_balance TEXT NOT NULL,
+                realized_pnl TEXT NOT NULL DEFAULT '0',
+                unrealized_pnl TEXT NOT NULL DEFAULT '0',
+                volume_traded TEXT NOT NULL DEFAULT '0',
+                trades_placed INTEGER NOT NULL DEFAULT 0,
+                trades_filled INTEGER NOT NULL DEFAULT 0,
+                trades_rejected INTEGER NOT NULL DEFAULT 0,
+                drawdown_pct TEXT NOT NULL DEFAULT '0',
+                paused_at TEXT,
+                notes TEXT
+            );
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+             );",
             )
             .map_err(|e| PolybotError::State(format!("Failed to create tables: {}", e)))?;
         Ok(())
@@ -87,12 +171,13 @@ impl SqliteStore {
 
     pub fn insert_trade(&self, trade: &Trade) -> Result<(), PolybotError> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO trades (id, signal_id, market_id, side, price, size, size_usd, filled_size, order_type, status, placed_at, filled_at, simulated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT OR REPLACE INTO trades (id, signal_id, market_id, category, side, price, size, size_usd, filled_size, order_type, status, placed_at, filled_at, simulated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 trade.id,
                 trade.signal_id,
                 trade.market_id,
+                trade.category.to_string(),
                 format!("{:?}", trade.side),
                 trade.price.to_string(),
                 trade.size.to_string(),
@@ -134,6 +219,280 @@ impl SqliteStore {
             .query_row("SELECT COUNT(*) FROM trades", [], |row| row.get(0))
             .map_err(|e| PolybotError::State(format!("Failed to count trades: {}", e)))?;
         Ok(count)
+    }
+
+    pub fn upsert_position(
+        &self,
+        position: &Position,
+        current_price: Option<Decimal>,
+        unrealized_pnl: Option<Decimal>,
+        owned_by_wallet: Option<&str>,
+    ) -> Result<(), PolybotError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO positions (id, market_id, side, entry_price, current_size, average_price, opened_at, status, category, current_price, unrealized_pnl, owned_by_wallet, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, CURRENT_TIMESTAMP)",
+            rusqlite::params![
+                position.id,
+                position.market_id,
+                format!("{:?}", position.side),
+                position.entry_price.to_string(),
+                position.current_size.to_string(),
+                position.average_price.to_string(),
+                position.opened_at.to_rfc3339(),
+                format!("{:?}", position.status),
+                position.category.to_string(),
+                current_price.map(|value| value.to_string()),
+                unrealized_pnl.map(|value| value.to_string()),
+                owned_by_wallet,
+            ],
+        ).map_err(|e| PolybotError::State(format!("Failed to upsert position: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn remove_position(&self, position_id: &str) -> Result<(), PolybotError> {
+        self.conn
+            .execute("DELETE FROM positions WHERE id = ?1", [position_id])
+            .map_err(|e| PolybotError::State(format!("Failed to delete position: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn list_open_positions(&self) -> Result<Vec<PersistedPositionRow>, PolybotError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, market_id, side, entry_price, current_size, average_price, opened_at, status, category, current_price, unrealized_pnl, owned_by_wallet, last_updated
+             FROM positions WHERE status = 'Open' OR status = 'open' ORDER BY opened_at ASC",
+        ).map_err(|e| PolybotError::State(format!("Failed to prepare open positions query: {}", e)))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let side_raw: String = row.get(2)?;
+                let status_raw: String = row.get(7)?;
+                let category_raw: String = row.get(8)?;
+                let opened_at: String = row.get(6)?;
+                let position = Position {
+                    id: row.get(0)?,
+                    market_id: row.get(1)?,
+                    side: match side_raw.as_str() {
+                        "Yes" | "YES" => Side::Yes,
+                        _ => Side::No,
+                    },
+                    entry_price: Decimal::from_str(&row.get::<_, String>(3)?)
+                        .unwrap_or(Decimal::ZERO),
+                    current_size: Decimal::from_str(&row.get::<_, String>(4)?)
+                        .unwrap_or(Decimal::ZERO),
+                    average_price: Decimal::from_str(&row.get::<_, String>(5)?)
+                        .unwrap_or(Decimal::ZERO),
+                    opened_at: chrono::DateTime::parse_from_rfc3339(&opened_at)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now()),
+                    status: match status_raw.as_str() {
+                        "Closed" | "closed" => PositionStatus::Closed,
+                        "Ghost" | "ghost" => PositionStatus::Ghost,
+                        _ => PositionStatus::Open,
+                    },
+                    category: Category::try_from(category_raw.as_str()).unwrap_or(Category::Other),
+                };
+                Ok(PersistedPositionRow {
+                    position,
+                    current_price: row
+                        .get::<_, Option<String>>(9)?
+                        .and_then(|value| Decimal::from_str(&value).ok()),
+                    unrealized_pnl: row
+                        .get::<_, Option<String>>(10)?
+                        .and_then(|value| Decimal::from_str(&value).ok()),
+                    owned_by_wallet: row.get(11)?,
+                    last_updated: row.get(12)?,
+                })
+            })
+            .map_err(|e| PolybotError::State(format!("Failed to query open positions: {}", e)))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| PolybotError::State(format!("Failed to read open positions: {}", e)))
+    }
+
+    pub fn lookup_signal_wallet(&self, signal_id: &str) -> Result<Option<String>, PolybotError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row(
+                "SELECT wallet_address FROM signal_log WHERE signal_id = ?1",
+                [signal_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| PolybotError::State(format!("Failed to lookup signal wallet: {}", e)))
+    }
+
+    pub fn set_config(&self, key: &str, value: &str) -> Result<(), PolybotError> {
+        self.conn
+            .execute(
+                "INSERT INTO config (key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![key, value],
+            )
+            .map_err(|e| PolybotError::State(format!("Failed to upsert config: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn get_config(&self, key: &str) -> Result<Option<String>, PolybotError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn
+            .query_row("SELECT value FROM config WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| PolybotError::State(format!("Failed to load config: {}", e)))
+    }
+
+    pub fn upsert_daily_stats(&self, stats: &DailyStatsRow) -> Result<(), PolybotError> {
+        self.conn.execute(
+            "INSERT INTO daily_stats (date, starting_balance, realized_pnl, unrealized_pnl, volume_traded, trades_placed, trades_filled, trades_rejected, drawdown_pct, paused_at, notes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(date) DO UPDATE SET
+                starting_balance = excluded.starting_balance,
+                realized_pnl = excluded.realized_pnl,
+                unrealized_pnl = excluded.unrealized_pnl,
+                volume_traded = excluded.volume_traded,
+                trades_placed = excluded.trades_placed,
+                trades_filled = excluded.trades_filled,
+                trades_rejected = excluded.trades_rejected,
+                drawdown_pct = excluded.drawdown_pct,
+                paused_at = excluded.paused_at,
+                notes = excluded.notes",
+            rusqlite::params![
+                stats.date,
+                stats.starting_balance.to_string(),
+                stats.realized_pnl.to_string(),
+                stats.unrealized_pnl.to_string(),
+                stats.volume_traded.to_string(),
+                stats.trades_placed,
+                stats.trades_filled,
+                stats.trades_rejected,
+                stats.drawdown_pct.to_string(),
+                stats.paused_at,
+                stats.notes,
+            ],
+        ).map_err(|e| PolybotError::State(format!("Failed to upsert daily stats: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn get_daily_stats(&self, date: &str) -> Result<Option<DailyStatsRow>, PolybotError> {
+        use rusqlite::OptionalExtension as _;
+        self.conn.query_row(
+            "SELECT date, starting_balance, realized_pnl, unrealized_pnl, volume_traded, trades_placed, trades_filled, trades_rejected, drawdown_pct, paused_at, notes FROM daily_stats WHERE date = ?1",
+            [date],
+            |row| {
+                Ok(DailyStatsRow {
+                    date: row.get(0)?,
+                    starting_balance: Decimal::from_str(&row.get::<_, String>(1)?).unwrap_or(Decimal::ZERO),
+                    realized_pnl: Decimal::from_str(&row.get::<_, String>(2)?).unwrap_or(Decimal::ZERO),
+                    unrealized_pnl: Decimal::from_str(&row.get::<_, String>(3)?).unwrap_or(Decimal::ZERO),
+                    volume_traded: Decimal::from_str(&row.get::<_, String>(4)?).unwrap_or(Decimal::ZERO),
+                    trades_placed: row.get(5)?,
+                    trades_filled: row.get(6)?,
+                    trades_rejected: row.get(7)?,
+                    drawdown_pct: Decimal::from_str(&row.get::<_, String>(8)?).unwrap_or(Decimal::ZERO),
+                    paused_at: row.get(9)?,
+                    notes: row.get(10)?,
+                })
+            },
+        ).optional().map_err(|e| PolybotError::State(format!("Failed to load daily stats: {}", e)))
+    }
+
+    pub fn upsert_target(
+        &self,
+        wallet_address: &str,
+        label: Option<&str>,
+        categories: &[Category],
+        score: Option<Decimal>,
+    ) -> Result<(), PolybotError> {
+        let categories_json = serde_json::to_string(categories).map_err(|e| {
+            PolybotError::State(format!("Failed to serialize target categories: {}", e))
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO targets (wallet_address, label, active, categories, score)
+             VALUES (?1, ?2, 1, ?3, ?4)
+             ON CONFLICT(wallet_address) DO UPDATE SET
+                label = excluded.label,
+                active = 1,
+                categories = excluded.categories,
+                score = excluded.score",
+                rusqlite::params![
+                    wallet_address.to_lowercase(),
+                    label,
+                    categories_json,
+                    score.map(|value| value.to_string())
+                ],
+            )
+            .map_err(|e| PolybotError::State(format!("Failed to upsert target wallet: {}", e)))?;
+        Ok(())
+    }
+
+    pub fn list_active_targets(&self) -> Result<Vec<TargetRow>, PolybotError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT wallet_address, label, categories, score, active FROM targets WHERE active = 1 ORDER BY added_at ASC",
+        ).map_err(|e| PolybotError::State(format!("Failed to prepare targets query: {}", e)))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let categories_json: String = row.get(2)?;
+                let categories =
+                    serde_json::from_str::<Vec<Category>>(&categories_json).unwrap_or_default();
+                let score = row
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|value| Decimal::from_str(&value).ok());
+                Ok(TargetRow {
+                    wallet_address: row.get::<_, String>(0)?.to_lowercase(),
+                    label: row.get(1)?,
+                    categories,
+                    score,
+                    active: row.get::<_, i64>(4)? == 1,
+                })
+            })
+            .map_err(|e| PolybotError::State(format!("Failed to query targets: {}", e)))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| PolybotError::State(format!("Failed to read targets: {}", e)))
+    }
+
+    pub fn latest_trades(&self, limit: usize) -> Result<Vec<RecentTradeRow>, PolybotError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, signal_id, market_id, COALESCE(category, ''), side, status, size_usd, placed_at, simulated
+                 FROM trades ORDER BY placed_at DESC LIMIT ?1",
+            )
+            .map_err(|e| PolybotError::State(format!("Failed to prepare trades query: {}", e)))?;
+
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                Ok(RecentTradeRow {
+                    id: row.get(0)?,
+                    signal_id: row.get(1)?,
+                    market_id: row.get(2)?,
+                    category: row.get(3)?,
+                    side: row.get(4)?,
+                    status: row.get(5)?,
+                    size_usd: Decimal::from_str(&row.get::<_, String>(6)?).unwrap_or(Decimal::ZERO),
+                    placed_at: row.get(7)?,
+                    simulated: row.get::<_, i64>(8)? == 1,
+                })
+            })
+            .map_err(|e| PolybotError::State(format!("Failed to query trades: {}", e)))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| PolybotError::State(format!("Failed to read trades: {}", e)))
+    }
+
+    pub fn deactivate_target(&self, wallet_address: &str) -> Result<(), PolybotError> {
+        self.conn
+            .execute(
+                "UPDATE targets SET active = 0 WHERE wallet_address = ?1",
+                [wallet_address.to_lowercase()],
+            )
+            .map_err(|e| {
+                PolybotError::State(format!("Failed to deactivate target wallet: {}", e))
+            })?;
+        Ok(())
     }
 
     pub fn latest_signals(&self, limit: usize) -> Result<Vec<SignalLogEntry>, PolybotError> {
@@ -242,5 +601,138 @@ mod tests {
         let signals = store.latest_signals(10).unwrap();
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].signal_id, "sig-1");
+    }
+
+    #[test]
+    fn upsert_and_list_open_positions_round_trip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let position = Position {
+            id: "pos-1".to_string(),
+            market_id: "market-1".to_string(),
+            side: Side::Yes,
+            entry_price: dec!(0.60),
+            current_size: dec!(100),
+            average_price: dec!(0.60),
+            opened_at: chrono::Utc::now(),
+            status: PositionStatus::Open,
+            category: Category::Politics,
+        };
+
+        store
+            .upsert_position(&position, Some(dec!(0.65)), Some(dec!(5)), Some("0xabc"))
+            .unwrap();
+
+        let positions = store.list_open_positions().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].position.market_id, "market-1");
+        assert_eq!(positions[0].current_price, Some(dec!(0.65)));
+        assert_eq!(positions[0].unrealized_pnl, Some(dec!(5)));
+        assert_eq!(positions[0].owned_by_wallet.as_deref(), Some("0xabc"));
+    }
+
+    #[test]
+    fn config_and_daily_stats_round_trip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .set_config("last_reconciliation_at", "2026-04-17T10:00:00Z")
+            .unwrap();
+        assert_eq!(
+            store
+                .get_config("last_reconciliation_at")
+                .unwrap()
+                .as_deref(),
+            Some("2026-04-17T10:00:00Z")
+        );
+
+        let stats = DailyStatsRow {
+            date: "2026-04-17".to_string(),
+            starting_balance: dec!(1000),
+            realized_pnl: dec!(25),
+            unrealized_pnl: dec!(10),
+            volume_traded: dec!(150),
+            trades_placed: 3,
+            trades_filled: 2,
+            trades_rejected: 1,
+            drawdown_pct: dec!(0.05),
+            paused_at: None,
+            notes: Some("healthy".to_string()),
+        };
+
+        store.upsert_daily_stats(&stats).unwrap();
+        let loaded = store.get_daily_stats("2026-04-17").unwrap().unwrap();
+        assert_eq!(loaded.realized_pnl, dec!(25));
+        assert_eq!(loaded.trades_filled, 2);
+        assert_eq!(loaded.notes.as_deref(), Some("healthy"));
+    }
+
+    #[test]
+    fn active_targets_round_trip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .upsert_target(
+                "0xabc123abc123abc123abc123abc123abc123abc1",
+                Some("leader"),
+                &[Category::Politics, Category::Crypto],
+                Some(dec!(72.5)),
+            )
+            .unwrap();
+
+        let targets = store.list_active_targets().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].wallet_address,
+            "0xabc123abc123abc123abc123abc123abc123abc1"
+        );
+        assert_eq!(
+            targets[0].categories,
+            vec![Category::Politics, Category::Crypto]
+        );
+        assert_eq!(targets[0].score, Some(dec!(72.5)));
+    }
+
+    #[test]
+    fn latest_trades_returns_most_recent_rows_in_desc_order() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let trade1 = Trade {
+            id: "t1".to_string(),
+            signal_id: "s1".to_string(),
+            market_id: "m1".to_string(),
+            category: Category::Politics,
+            side: Side::Yes,
+            price: dec!(0.55),
+            size: dec!(10),
+            size_usd: dec!(5.5),
+            filled_size: dec!(10),
+            order_type: OrderType::Limit,
+            status: TradeStatus::Filled,
+            placed_at: chrono::Utc::now() - chrono::Duration::seconds(30),
+            filled_at: Some(chrono::Utc::now() - chrono::Duration::seconds(20)),
+            simulated: true,
+        };
+        let trade2 = Trade {
+            id: "t2".to_string(),
+            signal_id: "s2".to_string(),
+            market_id: "m2".to_string(),
+            category: Category::Crypto,
+            side: Side::No,
+            price: dec!(0.65),
+            size: dec!(10),
+            size_usd: dec!(6.5),
+            filled_size: dec!(10),
+            order_type: OrderType::Fok,
+            status: TradeStatus::Filled,
+            placed_at: chrono::Utc::now(),
+            filled_at: Some(chrono::Utc::now()),
+            simulated: false,
+        };
+
+        store.insert_trade(&trade1).unwrap();
+        store.insert_trade(&trade2).unwrap();
+
+        let trades = store.latest_trades(10).unwrap();
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0].id, "t2");
+        assert_eq!(trades[1].id, "t1");
     }
 }

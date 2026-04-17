@@ -92,7 +92,35 @@ pub enum OrderType {
     PostOnly,
 }
 
-/// v2.5 Signal Schema — matches the PRD specification exactly.
+impl OrderType {
+    pub fn requires_price_buffer(self) -> bool {
+        matches!(self, OrderType::Fok)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    Simulation,
+    Shadow,
+    Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SignalSource {
+    Manual,
+    Polling,
+    Websocket,
+    Http,
+    Redis,
+}
+
+fn default_signal_source() -> SignalSource {
+    SignalSource::Manual
+}
+
+/// Signal schema (v2.5 base with Module 1 extensions for core fields).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signal {
     pub signal_id: String,
@@ -103,6 +131,20 @@ pub struct Signal {
     pub confidence: u8,
     pub secret_level: u8,
     pub category: Category,
+    #[serde(default = "default_signal_source")]
+    pub source: SignalSource,
+    #[serde(default)]
+    pub tx_hash: Option<String>,
+    #[serde(default)]
+    pub token_id: Option<String>,
+    #[serde(default)]
+    pub target_price: Option<Decimal>,
+    #[serde(default)]
+    pub target_size_usdc: Option<Decimal>,
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default)]
+    pub redeemable: bool,
     #[serde(default)]
     pub suggested_size_usdc: Option<Decimal>,
     #[serde(default = "default_scanner_version")]
@@ -125,11 +167,14 @@ pub enum ValidationError {
     InvalidTimestamp(String),
     InvalidWalletAddress(String),
     InvalidMarketId(String),
+    InvalidTxHash(String),
     SecretLevelOutOfRange(u8),
     ConfidenceOutOfRange(u8),
     InvalidSide(String),
     StaleTimestamp(String),
     FutureTimestamp(String),
+    ResolvedMarket(String),
+    RedeemableMarket(String),
     BlockedByConfidenceThreshold {
         confidence: u8,
         category: Category,
@@ -145,6 +190,13 @@ impl Signal {
     /// Returns Ok(()) if valid, or Err with list of validation errors.
     /// Signals with confidence < 3 or secret_level < 3 are flagged for manual review (not blocked here).
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
+        self.validate_with_max_age_secs(30)
+    }
+
+    pub fn validate_with_max_age_secs(
+        &self,
+        max_age_secs: i64,
+    ) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
 
         // signal_id: must be a valid UUID v4
@@ -160,9 +212,9 @@ impl Signal {
         // timestamp: must be valid ISO 8601, not older than 30s from now
         if let Ok(dt) = DateTime::parse_from_rfc3339(&self.timestamp) {
             let age = Utc::now().signed_duration_since(dt);
-            if age.num_seconds() > 30 {
+            if age.num_seconds() > max_age_secs {
                 errors.push(ValidationError::StaleTimestamp(self.timestamp.clone()));
-            } else if age.num_seconds() < -30 {
+            } else if age.num_seconds() < -max_age_secs {
                 errors.push(ValidationError::FutureTimestamp(self.timestamp.clone()));
             }
         } else {
@@ -181,9 +233,26 @@ impl Signal {
             ));
         }
 
+        if let Some(tx_hash) = &self.tx_hash {
+            let is_valid_hash = tx_hash.starts_with("0x")
+                && tx_hash.len() == 66
+                && tx_hash[2..].chars().all(|ch| ch.is_ascii_hexdigit());
+            if !is_valid_hash {
+                errors.push(ValidationError::InvalidTxHash(tx_hash.clone()));
+            }
+        }
+
         // market_id: must be non-empty
         if self.market_id.is_empty() {
             errors.push(ValidationError::InvalidMarketId(self.market_id.clone()));
+        }
+
+        if self.resolved {
+            errors.push(ValidationError::ResolvedMarket(self.market_id.clone()));
+        }
+
+        if self.redeemable {
+            errors.push(ValidationError::RedeemableMarket(self.market_id.clone()));
         }
 
         // secret_level: 1-10
@@ -338,6 +407,12 @@ mod tests {
         assert_eq!(json, "\"NO\"");
     }
 
+    #[test]
+    fn fok_requires_price_buffer() {
+        assert!(OrderType::Fok.requires_price_buffer());
+        assert!(!OrderType::Limit.requires_price_buffer());
+    }
+
     fn create_test_signal() -> Signal {
         Signal {
             signal_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
@@ -348,6 +423,13 @@ mod tests {
             confidence: 7,
             secret_level: 7,
             category: Category::Politics,
+            source: SignalSource::Manual,
+            tx_hash: None,
+            token_id: None,
+            target_price: None,
+            target_size_usdc: None,
+            resolved: false,
+            redeemable: false,
             suggested_size_usdc: Some(dec!(50)),
             scanner_version: "1.0.0".to_string(),
         }
@@ -359,6 +441,38 @@ mod tests {
         let mut signal = create_test_signal();
         signal.timestamp = Utc::now().to_rfc3339();
         assert!(signal.validate().is_ok());
+    }
+
+    #[test]
+    fn signal_validate_with_custom_max_age_accepts_recent_signal() {
+        let mut signal = create_test_signal();
+        signal.timestamp = (Utc::now() - chrono::Duration::seconds(45)).to_rfc3339();
+
+        assert!(signal.validate_with_max_age_secs(60).is_ok());
+    }
+
+    #[test]
+    fn signal_rejects_resolved_market() {
+        let mut signal = create_test_signal();
+        signal.timestamp = Utc::now().to_rfc3339();
+        signal.resolved = true;
+
+        let err = signal.validate().unwrap_err();
+        assert!(err
+            .iter()
+            .any(|e| matches!(e, ValidationError::ResolvedMarket(id) if id == "0xdef456")));
+    }
+
+    #[test]
+    fn signal_rejects_redeemable_market() {
+        let mut signal = create_test_signal();
+        signal.timestamp = Utc::now().to_rfc3339();
+        signal.redeemable = true;
+
+        let err = signal.validate().unwrap_err();
+        assert!(err
+            .iter()
+            .any(|e| matches!(e, ValidationError::RedeemableMarket(id) if id == "0xdef456")));
     }
 
     #[test]

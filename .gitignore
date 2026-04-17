@@ -11,6 +11,7 @@
 /*.sqlite
 /*.rdb
 /backups/
+/.polybot/
 
 # Scanner/runtime-generated files
 /signals/processed/

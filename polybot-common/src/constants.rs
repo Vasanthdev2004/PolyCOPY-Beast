@@ -1,3 +1,4 @@
+use crate::types::ExecutionMode;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
@@ -55,6 +56,8 @@ pub const MIN_POSITION_USDC: Decimal = dec!(5);
 pub const MAX_POSITION_USDC: Decimal = dec!(500);
 pub const MAX_CONCURRENT_POSITIONS: u32 = 20;
 pub const MAX_MARKET_LIQUIDITY_PCT: Decimal = dec!(0.02); // 2% of market liquidity
+
+pub const DEFAULT_EXECUTION_MODE: ExecutionMode = ExecutionMode::Simulation;
 
 pub const DEFAULT_DAILY_MAX_LOSS_PCT: Decimal = dec!(0.05);
 pub const DEFAULT_PER_MARKET_EXPOSURE_PCT: Decimal = dec!(0.10);

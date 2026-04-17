@@ -50,12 +50,42 @@ pub fn build_order(
     }
 }
 
+pub fn build_order_with_price_buffer(
+    decision: &RiskDecision,
+    market_context: &MarketContext,
+    fetched_price: Decimal,
+    size_usd: Decimal,
+    price_buffer: Decimal,
+    order_type: OrderType,
+) -> Order {
+    let planned_price = if order_type.requires_price_buffer() {
+        align_to_tick_size_up(
+            fetched_price * (Decimal::ONE + price_buffer),
+            market_context.tick_size,
+        )
+    } else {
+        fetched_price
+    };
+
+    let mut order = build_order(decision, market_context, planned_price, size_usd);
+    order.order_type = order_type;
+    order
+}
+
 fn align_to_tick_size(value: Decimal, tick_size: Decimal) -> Decimal {
     if tick_size <= Decimal::ZERO {
         return value.round_dp(2);
     }
 
     ((value / tick_size).floor() * tick_size).normalize()
+}
+
+fn align_to_tick_size_up(value: Decimal, tick_size: Decimal) -> Decimal {
+    if tick_size <= Decimal::ZERO {
+        return value.round_dp(2);
+    }
+
+    ((value / tick_size).ceil() * tick_size).normalize()
 }
 
 fn select_order_type(decision: &RiskDecision) -> OrderType {
@@ -170,6 +200,36 @@ mod tests {
 
         let order = build_order(&decision, &ctx, dec!(0.537), dec!(50));
         assert_eq!(order.price, dec!(0.537));
+    }
+
+    #[test]
+    fn fok_plan_applies_price_buffer() {
+        let decision = test_decision(dec!(1.0), dec!(1.0));
+        let ctx = test_market_context();
+        let order = build_order_with_price_buffer(
+            &decision,
+            &ctx,
+            dec!(0.50),
+            dec!(50),
+            dec!(0.01),
+            OrderType::Fok,
+        );
+        assert_eq!(order.price, dec!(0.51));
+    }
+
+    #[test]
+    fn fok_plan_is_not_silently_downgraded() {
+        let decision = test_decision(dec!(1.0), dec!(1.0));
+        let ctx = test_market_context();
+        let order = build_order_with_price_buffer(
+            &decision,
+            &ctx,
+            dec!(0.50),
+            dec!(50),
+            dec!(0.00),
+            OrderType::Fok,
+        );
+        assert_eq!(order.order_type, OrderType::Fok);
     }
 
     fn test_market_context() -> MarketContext {

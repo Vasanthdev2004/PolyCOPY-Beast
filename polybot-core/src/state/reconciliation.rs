@@ -5,6 +5,8 @@ use polybot_common::errors::PolybotError;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::telegram_bot::alerts::AlertBroadcaster;
+
 use super::positions::PositionManager;
 use super::redis_store::RedisStore;
 
@@ -15,6 +17,7 @@ pub struct Reconciler {
     full_interval_secs: u64,
     position_manager: Arc<Mutex<PositionManager>>,
     redis_url: Option<String>,
+    alerts: Option<AlertBroadcaster>,
 }
 
 impl Reconciler {
@@ -24,12 +27,18 @@ impl Reconciler {
             full_interval_secs: FULL_RECONCILIATION_INTERVAL_SECS,
             position_manager,
             redis_url,
+            alerts: None,
         }
     }
 
     pub fn with_intervals(mut self, light: u64, full: u64) -> Self {
         self.light_interval_secs = light;
         self.full_interval_secs = full;
+        self
+    }
+
+    pub fn with_alerts(mut self, alerts: Option<AlertBroadcaster>) -> Self {
+        self.alerts = alerts;
         self
     }
 
@@ -76,6 +85,9 @@ impl Reconciler {
                                     mismatches = result.mismatches.len(),
                                     "Light reconciliation found issues"
                                 );
+                                if let (Some(alerts), Some(message)) = (&self.alerts, result.alert_message()) {
+                                    alerts.warning(message);
+                                }
                             }
                         }
                         Err(e) => tracing::error!(error = %e, "Light reconciliation failed"),
@@ -91,6 +103,9 @@ impl Reconciler {
                                     mismatches = result.mismatches.len(),
                                     "Full reconciliation found issues"
                                 );
+                                if let (Some(alerts), Some(message)) = (&self.alerts, result.alert_message()) {
+                                    alerts.warning(message);
+                                }
                             }
                         }
                         Err(e) => tracing::error!(error = %e, "Full reconciliation failed"),
@@ -194,6 +209,20 @@ impl ReconciliationResult {
             || !self.mismatches.is_empty()
     }
 
+    pub fn alert_message(&self) -> Option<String> {
+        if !self.has_issues() {
+            return None;
+        }
+
+        Some(format!(
+            "Reconciliation mismatch detected: checked={} ghost={} missing={} mismatches={}",
+            self.checked,
+            self.ghost_positions.len(),
+            self.missing_positions.len(),
+            self.mismatches.len(),
+        ))
+    }
+
     pub fn summary(&self) -> String {
         format!(
             "Checked: {}\nGhost positions: {}\nMissing positions: {}\nMismatches: {}",
@@ -253,5 +282,19 @@ mod tests {
             mismatches: vec![],
         };
         assert!(!result.has_issues());
+    }
+
+    #[test]
+    fn reconciliation_result_produces_alert_message_when_issues_exist() {
+        let result = ReconciliationResult {
+            checked: 3,
+            ghost_positions: vec!["m1".to_string()],
+            missing_positions: vec!["m2".to_string()],
+            mismatches: vec![],
+        };
+
+        let message = result.alert_message().unwrap();
+        assert!(message.contains("ghost=1"));
+        assert!(message.contains("missing=1"));
     }
 }

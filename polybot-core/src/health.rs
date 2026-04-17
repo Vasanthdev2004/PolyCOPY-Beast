@@ -1,11 +1,14 @@
-use axum::{extract::{Query, State}, response::{Html, Json}, routing::get, Router};
+use axum::{extract::{Query, State}, http::StatusCode, response::{Html, Json}, routing::{get, post}, Router};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::risk::RiskEngine;
 use crate::metrics::Metrics;
-use crate::state::{redis_store::RedisStore, sqlite::{SignalLogEntry, SqliteStore}};
+use crate::state::{self, positions::PositionManager, redis_store::RedisStore, sqlite::{RecentTradeRow, SignalLogEntry, SqliteStore}};
 use polybot_common::types::Position;
+use rust_decimal::Decimal;
+use tokio::sync::Mutex;
 
 const DASHBOARD_HTML: &str = include_str!("dashboard_page.html");
 
@@ -17,11 +20,24 @@ pub struct HealthState {
     pub metrics: Arc<Metrics>,
     pub redis_url: String,
     pub sqlite_path: String,
+    pub starting_balance: Decimal,
+    pub risk_engine: Arc<RiskEngine>,
+    pub position_manager: Arc<Mutex<PositionManager>>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SignalsQuery {
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TradesQuery {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ResumeQuery {
+    pub confirm: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -34,11 +50,19 @@ pub struct HealthResponse {
     pub redis_connected: bool,
     pub last_signal_at: Option<String>,
     pub daily_pnl: String,
+    pub balance_usd: String,
+    pub drawdown_pct: String,
     pub paused: bool,
     pub open_positions: u64,
     pub signals_received: u64,
     pub signals_processed: u64,
     pub emergency_stops: u64,
+}
+
+#[derive(Serialize)]
+pub struct ControlResponse {
+    pub ok: bool,
+    pub message: String,
 }
 
 pub async fn health_check(State(state): State<Arc<HealthState>>) -> Json<HealthResponse> {
@@ -69,6 +93,19 @@ pub async fn health_check(State(state): State<Arc<HealthState>>) -> Json<HealthR
         == 1;
     let rpc_status = if rpc_healthy { "healthy" } else { "unhealthy" }.to_string();
     let paused = metrics.is_paused() || state.paused;
+    let (balance_usd, drawdown_pct) = match SqliteStore::open(std::path::Path::new(&state.sqlite_path)) {
+        Ok(store) => {
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            match store.get_daily_stats(&today).ok().flatten() {
+                Some(stats) => {
+                    let balance = stats.starting_balance + stats.realized_pnl + stats.unrealized_pnl;
+                    (balance, stats.drawdown_pct * Decimal::new(100, 0))
+                }
+                None => (state.starting_balance, Decimal::ZERO),
+            }
+        }
+        Err(_) => (state.starting_balance, Decimal::ZERO),
+    };
 
     Json(HealthResponse {
         status: if paused {
@@ -83,6 +120,8 @@ pub async fn health_check(State(state): State<Arc<HealthState>>) -> Json<HealthR
         redis_connected,
         last_signal_at: last_signal,
         daily_pnl: format!("{:.2}", metrics.daily_pnl_usd()),
+        balance_usd: format!("{:.2}", balance_usd),
+        drawdown_pct: format!("{:.2}", drawdown_pct),
         paused,
         open_positions: metrics
             .open_positions
@@ -148,9 +187,18 @@ pub async fn metrics_handler(State(state): State<Arc<HealthState>>) -> String {
 pub async fn positions_handler(
     State(state): State<Arc<HealthState>>,
 ) -> Json<Vec<Position>> {
-    match RedisStore::new(&state.redis_url).await {
-        Ok(store) => Json(store.list_positions().await.unwrap_or_default()),
-        Err(_) => Json(Vec::new()),
+    match SqliteStore::open(std::path::Path::new(&state.sqlite_path)) {
+        Ok(store) => match store.list_open_positions() {
+            Ok(rows) if !rows.is_empty() => Json(rows.into_iter().map(|row| row.position).collect()),
+            _ => match RedisStore::new(&state.redis_url).await {
+                Ok(store) => Json(store.list_positions().await.unwrap_or_default()),
+                Err(_) => Json(Vec::new()),
+            },
+        },
+        Err(_) => match RedisStore::new(&state.redis_url).await {
+            Ok(store) => Json(store.list_positions().await.unwrap_or_default()),
+            Err(_) => Json(Vec::new()),
+        },
     }
 }
 
@@ -165,6 +213,80 @@ pub async fn signals_handler(
     }
 }
 
+pub async fn executions_handler(
+    State(state): State<Arc<HealthState>>,
+    Query(query): Query<TradesQuery>,
+) -> Json<Vec<RecentTradeRow>> {
+    let limit = query.limit.unwrap_or(10);
+    match SqliteStore::open(std::path::Path::new(&state.sqlite_path)) {
+        Ok(store) => Json(store.latest_trades(limit).unwrap_or_default()),
+        Err(_) => Json(Vec::new()),
+    }
+}
+
+pub async fn pause_handler(
+    State(state): State<Arc<HealthState>>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ControlResponse>)> {
+    state.risk_engine.set_emergency_stop(true).await;
+    state.metrics.set_paused(true);
+    Ok(Json(ControlResponse { ok: true, message: "Trading paused.".to_string() }))
+}
+
+pub async fn resume_handler(
+    State(state): State<Arc<HealthState>>,
+    Query(query): Query<ResumeQuery>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ControlResponse>)> {
+    if state.risk_engine.is_loss_cooldown_active().await && query.confirm != Some(true) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ControlResponse {
+                ok: false,
+                message: "Resume is blocked by active loss cooldown. Retry with ?confirm=true once you explicitly want to override it.".to_string(),
+            }),
+        ));
+    }
+
+    if state.risk_engine.resume_requires_confirmation().await && query.confirm != Some(true) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ControlResponse {
+                ok: false,
+                message: "Resume requires confirmation after a protection trigger. Retry with ?confirm=true".to_string(),
+            }),
+        ));
+    }
+
+    state.risk_engine.set_emergency_stop(false).await;
+    state.risk_engine.clear_resume_confirmation().await;
+    state.metrics.set_paused(false);
+    Ok(Json(ControlResponse { ok: true, message: "Trading resumed.".to_string() }))
+}
+
+pub async fn emergency_stop_handler(
+    State(state): State<Arc<HealthState>>,
+) -> Result<Json<ControlResponse>, (StatusCode, Json<ControlResponse>)> {
+    state.risk_engine.set_emergency_stop(true).await;
+    state.metrics.record_emergency_stop();
+    state.metrics.set_paused(true);
+    let closed_positions = state::force_flatten_positions(
+        Some(state.redis_url.as_str()),
+        state.metrics.clone(),
+        state.position_manager.clone(),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ControlResponse { ok: false, message: format!("Emergency stop failed: {}", e) }),
+        )
+    })?;
+
+    Ok(Json(ControlResponse {
+        ok: true,
+        message: format!("Emergency stop applied. Closed {} positions.", closed_positions),
+    }))
+}
+
 pub async fn dashboard_handler() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
@@ -177,6 +299,10 @@ pub fn create_health_router(state: Arc<HealthState>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/positions", get(positions_handler))
         .route("/signals", get(signals_handler))
+        .route("/executions", get(executions_handler))
+        .route("/control/pause", post(pause_handler))
+        .route("/control/resume", post(resume_handler))
+        .route("/control/emergency-stop", post(emergency_stop_handler))
         .with_state(state)
 }
 
@@ -198,4 +324,121 @@ pub async fn start_health_server(
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::risk::RiskEngine;
+    use crate::state::positions::PositionManager;
+    use rust_decimal_macros::dec;
+    use tokio::sync::Mutex;
+
+    fn test_health_state(sqlite_path: String) -> Arc<HealthState> {
+        let metrics = Arc::new(Metrics::new());
+        let position_manager = Arc::new(Mutex::new(PositionManager::new()));
+        let risk_engine = Arc::new(RiskEngine::new(
+            Arc::new(AppConfig::default()),
+            metrics.clone(),
+            position_manager.clone(),
+            None,
+        ));
+
+        Arc::new(HealthState {
+            start_time: SystemTime::now(),
+            simulation_mode: true,
+            paused: false,
+            metrics,
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            sqlite_path,
+            starting_balance: dec!(1000),
+            risk_engine,
+            position_manager,
+        })
+    }
+
+    #[tokio::test]
+    async fn health_check_includes_balance_and_drawdown_fields() {
+        let sqlite_path = std::env::temp_dir().join(format!("polybot-health-{}.db", uuid::Uuid::new_v4()));
+        let state = test_health_state(sqlite_path.to_string_lossy().to_string());
+
+        let response = health_check(State(state)).await.0;
+        assert_eq!(response.balance_usd, "1000.00");
+        assert_eq!(response.drawdown_pct, "0.00");
+
+        let _ = std::fs::remove_file(sqlite_path);
+    }
+
+    #[test]
+    fn health_router_exposes_executions_and_control_routes() {
+        let sqlite_path = std::env::temp_dir().join(format!("polybot-health-routes-{}.db", uuid::Uuid::new_v4()));
+        let state = test_health_state(sqlite_path.to_string_lossy().to_string());
+        let router = create_health_router(state);
+
+        let dbg = format!("{:?}", router);
+        assert!(dbg.contains("/executions"));
+        assert!(dbg.contains("/control/pause"));
+        assert!(dbg.contains("/control/resume"));
+        assert!(dbg.contains("/control/emergency-stop"));
+
+        let _ = std::fs::remove_file(sqlite_path);
+    }
+
+    #[tokio::test]
+    async fn positions_handler_prefers_sqlite_positions_when_available() {
+        let sqlite_path = std::env::temp_dir().join(format!("polybot-health-pos-{}.db", uuid::Uuid::new_v4()));
+        let state = test_health_state(sqlite_path.to_string_lossy().to_string());
+        let store = SqliteStore::open(&sqlite_path).unwrap();
+        let position = polybot_common::types::Position {
+            id: "pos-1".to_string(),
+            market_id: "market-1".to_string(),
+            side: polybot_common::types::Side::Yes,
+            entry_price: dec!(0.55),
+            current_size: dec!(10),
+            average_price: dec!(0.55),
+            opened_at: chrono::Utc::now(),
+            status: polybot_common::types::PositionStatus::Open,
+            category: polybot_common::types::Category::Politics,
+        };
+        store.upsert_position(&position, Some(dec!(0.60)), Some(dec!(0.5)), Some("0xabc")).unwrap();
+
+        let positions = positions_handler(State(state)).await.0;
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].market_id, "market-1");
+
+        let _ = std::fs::remove_file(sqlite_path);
+    }
+
+    #[tokio::test]
+    async fn resume_handler_requires_explicit_confirmation_after_loss_breach() {
+        let sqlite_path = std::env::temp_dir().join(format!("polybot-health-resume-{}.db", uuid::Uuid::new_v4()));
+        let metrics = Arc::new(Metrics::new());
+        let position_manager = Arc::new(Mutex::new(PositionManager::new()));
+        let mut config = AppConfig::default();
+        config.risk.max_consecutive_losses = 1;
+        let risk_engine = Arc::new(RiskEngine::new(
+            Arc::new(config),
+            metrics.clone(),
+            position_manager.clone(),
+            None,
+        ));
+        risk_engine.record_realized_outcome(dec!(-1)).await;
+        let state = Arc::new(HealthState {
+            start_time: SystemTime::now(),
+            simulation_mode: true,
+            paused: false,
+            metrics,
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            sqlite_path: sqlite_path.to_string_lossy().to_string(),
+            starting_balance: dec!(1000),
+            risk_engine,
+            position_manager,
+        });
+
+        let result = resume_handler(State(state), Query(ResumeQuery { confirm: None })).await;
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(sqlite_path);
+    }
 }

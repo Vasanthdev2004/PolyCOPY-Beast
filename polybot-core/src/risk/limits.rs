@@ -94,6 +94,13 @@ mod tests {
             confidence,
             secret_level,
             category,
+            source: SignalSource::Manual,
+            tx_hash: None,
+            token_id: None,
+            target_price: None,
+            target_size_usdc: None,
+            resolved: false,
+            redeemable: false,
             suggested_size_usdc: Some(dec!(50)),
             scanner_version: "1.0.0".to_string(),
         }

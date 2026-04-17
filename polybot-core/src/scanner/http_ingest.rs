@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use tracing;
 
 use crate::config::AppConfig;
-use crate::scanner::schema::validate_and_create_event;
+use crate::scanner::schema::validate_and_create_event_with_max_age;
 use polybot_common::errors::PolybotError;
 use polybot_common::types::ScannerEvent;
 
@@ -12,6 +12,7 @@ use polybot_common::types::ScannerEvent;
 pub struct AppState {
     pub signal_sender: mpsc::Sender<ScannerEvent>,
     pub api_key: String,
+    pub signal_max_age_secs: u64,
 }
 
 async fn ingest_signal(
@@ -29,7 +30,7 @@ async fn ingest_signal(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    match validate_and_create_event(&body) {
+    match validate_and_create_event_with_max_age(&body, state.signal_max_age_secs) {
         Ok(event) => {
             tracing::info!(
                 signal_id = %event.signal.signal_id,
@@ -59,6 +60,7 @@ pub async fn start_http_server(
     let state = Arc::new(AppState {
         signal_sender,
         api_key,
+        signal_max_age_secs: config.scanner.signal_max_age_secs,
     });
 
     let app = Router::new()

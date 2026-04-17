@@ -21,7 +21,10 @@ impl DedupFilter {
 
     /// v2.5: Dedup key is signal_id within rolling 5-minute window
     pub fn dedup_key(signal: &polybot_common::types::Signal) -> String {
-        signal.signal_id.clone()
+        signal
+            .tx_hash
+            .clone()
+            .unwrap_or_else(|| signal.signal_id.clone())
     }
 
     pub fn check_and_record(&mut self, event: &ScannerEvent) -> bool {
@@ -92,6 +95,13 @@ mod tests {
                 confidence: 7,
                 secret_level: 7,
                 category: Category::Politics,
+                source: SignalSource::Manual,
+                tx_hash: None,
+                token_id: None,
+                target_price: None,
+                target_size_usdc: None,
+                resolved: false,
+                redeemable: false,
                 suggested_size_usdc: Some(dec!(50)),
                 scanner_version: "1.0.0".to_string(),
             },
@@ -122,5 +132,20 @@ mod tests {
         let event2 = test_event("sig-2");
         assert!(filter.check_and_record(&event1));
         assert!(filter.check_and_record(&event2));
+    }
+
+    #[test]
+    fn dedup_prefers_tx_hash_when_present() {
+        let mut filter = DedupFilter::new(300);
+        let mut event1 = test_event("sig-1");
+        event1.signal.tx_hash = Some(
+            "0xfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeedfeed"
+                .to_string(),
+        );
+        let mut event2 = test_event("sig-2");
+        event2.signal.tx_hash = event1.signal.tx_hash.clone();
+
+        assert!(filter.check_and_record(&event1));
+        assert!(!filter.check_and_record(&event2));
     }
 }

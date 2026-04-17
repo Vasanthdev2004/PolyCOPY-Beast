@@ -31,6 +31,20 @@ pub fn calculate_unrealized_pnl(
         .fold(Decimal::ZERO, |acc, pnl| acc + pnl)
 }
 
+pub fn calculate_realized_pnl_for_position(
+    position: &polybot_common::types::Position,
+    exit_price: Decimal,
+) -> Decimal {
+    match position.side {
+        polybot_common::types::Side::Yes => {
+            (exit_price - position.average_price) * position.current_size
+        }
+        polybot_common::types::Side::No => {
+            (position.average_price - exit_price) * position.current_size
+        }
+    }
+}
+
 /// Calculate realized PnL from closed trades.
 /// Realized PnL = sum of (exit_value - entry_value) for all closed trades.
 #[allow(dead_code)]
@@ -98,5 +112,25 @@ mod tests {
         assert_eq!(total, dec!(5000));
         assert_eq!(unrealized, Decimal::ZERO);
         assert_eq!(realized, Decimal::ZERO);
+    }
+
+    #[test]
+    fn realized_pnl_for_yes_position_uses_exit_price() {
+        let position = polybot_common::types::Position {
+            id: "p1".to_string(),
+            market_id: "m1".to_string(),
+            side: polybot_common::types::Side::Yes,
+            entry_price: dec!(0.50),
+            current_size: dec!(100),
+            average_price: dec!(0.50),
+            opened_at: chrono::Utc::now(),
+            status: polybot_common::types::PositionStatus::Open,
+            category: polybot_common::types::Category::Politics,
+        };
+
+        assert_eq!(
+            calculate_realized_pnl_for_position(&position, dec!(0.70)),
+            dec!(20)
+        );
     }
 }

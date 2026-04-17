@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use polybot_common::types::ExecutionMode;
+
 /// v2.5: Two-step confirmation for destructive commands.
 /// After a destructive command, the user must send /confirm within 30 seconds.
 pub struct ConfirmState {
@@ -18,6 +20,7 @@ pub enum ConfirmAction {
     EmergencyStop,
     WalletRemove(String),
     ResumeAfterLoss,
+    ModeSwitch(ExecutionMode),
 }
 
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);

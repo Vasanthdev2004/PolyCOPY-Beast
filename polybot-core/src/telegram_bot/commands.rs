@@ -9,14 +9,102 @@ use super::Command;
 use crate::config::AppConfig;
 use crate::metrics::Metrics;
 use crate::risk::RiskEngine;
+use crate::setup;
 use crate::state;
 use crate::state::positions::PositionManager;
 use crate::state::reconciliation::Reconciler;
 use crate::state::redis_store::RedisStore;
-use crate::state::sqlite::{SignalLogEntry, SqliteStore};
-use polybot_common::types::Position;
+use crate::state::sqlite::{SignalLogEntry, SqliteStore, TargetRow};
+use polybot_common::types::{ExecutionMode, Position};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+fn resolve_report_period(period: Option<&str>) -> Result<&'static str, &'static str> {
+    match period.map(|p| p.trim().to_lowercase()) {
+        None => Ok("Daily"),
+        Some(p) if p.is_empty() || p == "daily" => Ok("Daily"),
+        Some(p) if p == "weekly" => Ok("Weekly"),
+        _ => Err("Usage: /report [daily|weekly]"),
+    }
+}
+
+fn resolve_mode_switch(mode: Option<&str>) -> Result<ExecutionMode, &'static str> {
+    match mode.map(|m| m.trim().to_lowercase()) {
+        Some(m) if m == "sim" || m == "simulation" => Ok(ExecutionMode::Simulation),
+        Some(m) if m == "live" => Ok(ExecutionMode::Live),
+        Some(m) if m == "shadow" => Ok(ExecutionMode::Shadow),
+        _ => Err("Usage: /mode [sim|live|shadow]"),
+    }
+}
+
+fn format_wallet_score_message(target: &TargetRow) -> String {
+    let label = target.label.as_deref().unwrap_or("(no label)");
+    let categories = if target.categories.is_empty() {
+        "all".to_string()
+    } else {
+        target
+            .categories
+            .iter()
+            .map(|category| category.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let score = target
+        .score
+        .map(|value| format!("{:.2}", value))
+        .unwrap_or_else(|| "No score available".to_string());
+
+    format!(
+        "Wallet score\nAddress: {}\nLabel: {}\nCategories: {}\nScore: {}",
+        target.wallet_address, label, categories, score
+    )
+}
+
+fn requested_mode_key() -> &'static str {
+    "requested_execution_mode"
+}
+
+fn load_requested_mode_summary() -> Option<String> {
+    let sqlite_path = std::env::var("POLYBOT_SQLITE_PATH").unwrap_or_else(|_| "./polybot.db".to_string());
+    SqliteStore::open(std::path::Path::new(&sqlite_path))
+        .ok()
+        .and_then(|store| store.get_config(requested_mode_key()).ok().flatten())
+}
+
+async fn confirm_mode_switch(
+    config: &Arc<AppConfig>,
+    mode: ExecutionMode,
+) -> Result<String, String> {
+    let mut requested = (**config).clone();
+    requested.system.execution_mode = mode;
+    requested.system.simulation = matches!(mode, ExecutionMode::Simulation);
+
+    if !matches!(mode, ExecutionMode::Simulation) {
+        setup::run_startup_preflight(&requested)
+            .await
+            .map_err(|e| format!("Mode switch validation failed: {}", e))?;
+    }
+
+    let sqlite_path = std::env::var("POLYBOT_SQLITE_PATH")
+        .unwrap_or_else(|_| "./polybot.db".to_string());
+    let store = SqliteStore::open(std::path::Path::new(&sqlite_path))
+        .map_err(|e| format!("Failed to open SQLite for mode switch persistence: {}", e))?;
+    store
+        .set_config(
+            requested_mode_key(),
+            match mode {
+                ExecutionMode::Simulation => "simulation",
+                ExecutionMode::Shadow => "shadow",
+                ExecutionMode::Live => "live",
+            },
+        )
+        .map_err(|e| format!("Failed to persist requested mode: {}", e))?;
+
+    Ok(format!(
+        "Mode switch to {:?} validated and staged. Restart required to apply.",
+        mode
+    ))
+}
 
 pub async fn handle_command(
     bot: Bot,
@@ -52,10 +140,10 @@ pub async fn handle_command(
 
     match cmd {
         Command::Status => {
-            let mode = if config.system.simulation {
-                "SIMULATION"
-            } else {
-                "LIVE"
+            let mode = match config.system.execution_mode {
+                ExecutionMode::Simulation => "SIMULATION",
+                ExecutionMode::Shadow => "SHADOW",
+                ExecutionMode::Live => "LIVE",
             };
             let uptime = metrics.uptime_secs();
             let uptime_fmt = format!(
@@ -87,24 +175,44 @@ pub async fn handle_command(
             } else {
                 "ACTIVE"
             };
+            let pending_mode = load_requested_mode_summary()
+                .map(|mode| format!("\nPending mode switch: {} (restart required)", mode.to_uppercase()))
+                .unwrap_or_default();
 
             bot.send_message(
                 msg.chat.id,
                 format!(
-                    "SuperFast PolyBot v2.5\nMode: {}\nStatus: {}\nUptime: {}\nPositions: {}\nSignals: {}\nFollowed wallets: {}\nWS: {}\nRedis: {}\nRPC: {}",
-                    mode, bot_status, uptime_fmt, open, sigs, wallets, ws, redis, rpc
+                    "SuperFast PolyBot v3\nMode: {}\nStatus: {}\nUptime: {}\nPositions: {}\nSignals: {}\nFollowed wallets: {}\nWS: {}\nRedis: {}\nRPC: {}{}",
+                    mode, bot_status, uptime_fmt, open, sigs, wallets, ws, redis, rpc, pending_mode
                 )
             ).await?;
         }
 
         Command::Positions => {
             let pnl = metrics.daily_pnl_usd();
-            let body = match RedisStore::new(&config.redis.url).await {
-                Ok(store) => match store.list_positions().await {
-                    Ok(positions) => format_positions_message(&positions, pnl),
+            let sqlite_path = std::env::var("POLYBOT_SQLITE_PATH")
+                .unwrap_or_else(|_| "./polybot.db".to_string());
+            let body = match SqliteStore::open(std::path::Path::new(&sqlite_path)) {
+                Ok(store) => match store.list_open_positions() {
+                    Ok(rows) if !rows.is_empty() => {
+                        let positions = rows.into_iter().map(|row| row.position).collect::<Vec<_>>();
+                        format_positions_message(&positions, pnl)
+                    }
+                    _ => match RedisStore::new(&config.redis.url).await {
+                        Ok(store) => match store.list_positions().await {
+                            Ok(positions) => format_positions_message(&positions, pnl),
+                            Err(_) => fallback_positions_message(&metrics),
+                        },
+                        Err(_) => fallback_positions_message(&metrics),
+                    },
+                },
+                Err(_) => match RedisStore::new(&config.redis.url).await {
+                    Ok(store) => match store.list_positions().await {
+                        Ok(positions) => format_positions_message(&positions, pnl),
+                        Err(_) => fallback_positions_message(&metrics),
+                    },
                     Err(_) => fallback_positions_message(&metrics),
                 },
-                Err(_) => fallback_positions_message(&metrics),
             };
 
             bot.send_message(msg.chat.id, body).await?;
@@ -196,42 +304,78 @@ pub async fn handle_command(
             }
             Some(ConfirmAction::WalletRemove(addr)) => {
                 risk_engine.remove_followed_wallet(&addr).await;
+                let sqlite_path = std::env::var("POLYBOT_SQLITE_PATH")
+                    .unwrap_or_else(|_| "./polybot.db".to_string());
+                if let Ok(store) = SqliteStore::open(std::path::Path::new(&sqlite_path)) {
+                    let _ = store.deactivate_target(&addr);
+                }
                 bot.send_message(msg.chat.id, format!("Wallet {} removal confirmed.", addr))
                     .await?;
+            }
+            Some(ConfirmAction::ModeSwitch(mode)) => {
+                match confirm_mode_switch(&config, mode).await {
+                    Ok(message) => {
+                        bot.send_message(msg.chat.id, message).await?;
+                    }
+                    Err(message) => {
+                        bot.send_message(msg.chat.id, message).await?;
+                    }
+                }
             }
             None => {
                 bot.send_message(msg.chat.id, "No pending confirmation. Send a destructive command first, then /confirm within 30 seconds.").await?;
             }
         },
 
-        Command::Report => {
-            bot.send_message(msg.chat.id, alerts::format_report(&metrics, "Daily")).await?;
-        }
+        Command::Report(period) => match resolve_report_period(period.as_deref()) {
+            Ok(period) => {
+                bot.send_message(msg.chat.id, alerts::format_report(&metrics, period)).await?;
+            }
+            Err(message) => {
+                bot.send_message(msg.chat.id, message).await?;
+            }
+        },
 
         Command::Wallet(action, address) => {
-            if !risk_engine.is_emergency_stop().await {
+            let requires_pause = matches!(action.as_str(), "add" | "remove");
+            if requires_pause && !risk_engine.is_emergency_stop().await {
                 bot.send_message(msg.chat.id, "Pause trading before changing the followed wallet list.")
                     .await?;
                 return Ok(());
             }
 
             match action.as_str() {
-                "add" => match risk_engine.add_followed_wallet(&address).await {
-                    Ok(()) => {
-                        bot.send_message(msg.chat.id, format!("Wallet {} added to copy list.", address)).await?;
-                    }
-                    Err(e) => {
-                        bot.send_message(msg.chat.id, format!("Wallet add failed: {}", e)).await?;
+                "add" => match address.as_deref() {
+                    Some(address) => match risk_engine.add_followed_wallet(address).await {
+                        Ok(()) => {
+                            let sqlite_path = std::env::var("POLYBOT_SQLITE_PATH")
+                                .unwrap_or_else(|_| "./polybot.db".to_string());
+                            if let Ok(store) = SqliteStore::open(std::path::Path::new(&sqlite_path)) {
+                                let _ = store.upsert_target(address, None, &config.scanner.target_categories, None);
+                            }
+                            bot.send_message(msg.chat.id, format!("Wallet {} added to copy list.", address)).await?;
+                        }
+                        Err(e) => {
+                            bot.send_message(msg.chat.id, format!("Wallet add failed: {}", e)).await?;
+                        }
+                    },
+                    None => {
+                        bot.send_message(msg.chat.id, "Usage: /wallet add <address>").await?;
                     }
                 },
-                "remove" => {
-                    confirm_state.register(user_id, ConfirmAction::WalletRemove(address.clone()));
-                    bot.send_message(
-                        msg.chat.id,
-                        format!("Removing wallet {} is destructive. Reply /confirm within 30 seconds.", address),
-                    )
-                    .await?;
-                }
+                "remove" => match address {
+                    Some(address) => {
+                        confirm_state.register(user_id, ConfirmAction::WalletRemove(address.clone()));
+                        bot.send_message(
+                            msg.chat.id,
+                            format!("Removing wallet {} is destructive. Reply /confirm within 30 seconds.", address),
+                        )
+                        .await?;
+                    }
+                    None => {
+                        bot.send_message(msg.chat.id, "Usage: /wallet remove <address>").await?;
+                    }
+                },
                 "list" => {
                     let wallets = risk_engine.list_followed_wallets().await;
                     let body = if wallets.is_empty() {
@@ -241,12 +385,50 @@ pub async fn handle_command(
                     };
                     bot.send_message(msg.chat.id, body).await?;
                 }
+                "score" => match address.as_deref() {
+                    Some(address) => {
+                        let sqlite_path = std::env::var("POLYBOT_SQLITE_PATH")
+                            .unwrap_or_else(|_| "./polybot.db".to_string());
+                        let body = match SqliteStore::open(std::path::Path::new(&sqlite_path)) {
+                            Ok(store) => match store.list_active_targets() {
+                                Ok(targets) => targets
+                                    .into_iter()
+                                    .find(|target| target.wallet_address == address.to_lowercase())
+                                    .map(|target| format_wallet_score_message(&target))
+                                    .unwrap_or_else(|| format!("No active target record for wallet {}", address)),
+                                Err(e) => format!("Wallet score lookup failed: {}", e),
+                            },
+                            Err(e) => format!("Wallet score lookup failed: {}", e),
+                        };
+                        bot.send_message(msg.chat.id, body).await?;
+                    }
+                    None => {
+                        bot.send_message(msg.chat.id, "Usage: /wallet score <address>").await?;
+                    }
+                },
                 _ => {
-                    bot.send_message(msg.chat.id, "Usage: /wallet add <address> | /wallet remove <address> | /wallet list x")
+                    bot.send_message(msg.chat.id, "Usage: /wallet add <address> | /wallet remove <address> | /wallet list | /wallet score <address>")
                         .await?;
                 }
             }
         }
+
+        Command::Mode(requested_mode) => match resolve_mode_switch(requested_mode.as_deref()) {
+            Ok(mode) => {
+                confirm_state.register(user_id, ConfirmAction::ModeSwitch(mode));
+                bot.send_message(
+                    msg.chat.id,
+                    format!(
+                        "Mode switch to {:?} requires confirmation. Reply /confirm within 30 seconds.",
+                        mode
+                    ),
+                )
+                .await?;
+            }
+            Err(message) => {
+                bot.send_message(msg.chat.id, message).await?;
+            }
+        },
 
         Command::Config(key, value) => {
             match risk_engine.update_runtime_config(&key, &value).await {
@@ -417,5 +599,40 @@ mod tests {
         assert!(output.contains("market-1"));
         assert!(output.contains("conf=8"));
         assert!(output.contains("execute"));
+    }
+
+    #[test]
+    fn resolve_report_period_defaults_to_daily_and_supports_weekly() {
+        assert_eq!(resolve_report_period(None).unwrap(), "Daily");
+        assert_eq!(resolve_report_period(Some("weekly")).unwrap(), "Weekly");
+        assert!(resolve_report_period(Some("monthly")).is_err());
+    }
+
+    #[test]
+    fn resolve_mode_switch_parses_live_and_simulation_aliases() {
+        assert_eq!(
+            resolve_mode_switch(Some("live")).unwrap(),
+            polybot_common::types::ExecutionMode::Live
+        );
+        assert_eq!(
+            resolve_mode_switch(Some("sim")).unwrap(),
+            polybot_common::types::ExecutionMode::Simulation
+        );
+        assert!(resolve_mode_switch(Some("paper")).is_err());
+    }
+
+    #[test]
+    fn wallet_score_message_handles_missing_score() {
+        let target = crate::state::sqlite::TargetRow {
+            wallet_address: "0xabc123abc123abc123abc123abc123abc123abc1".to_string(),
+            label: Some("leader".to_string()),
+            categories: vec![Category::Politics],
+            score: None,
+            active: true,
+        };
+
+        let output = format_wallet_score_message(&target);
+        assert!(output.contains("leader"));
+        assert!(output.contains("No score available"));
     }
 }

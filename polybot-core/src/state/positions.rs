@@ -72,27 +72,34 @@ impl PositionManager {
     }
 
     pub fn close_position(&mut self, key: &PositionKey) -> Result<Position, PolybotError> {
-        let mut position = self
-            .positions
-            .remove(key)
-            .ok_or_else(|| {
-                PolybotError::State(format!(
-                    "Position not found: market={} side={:?}",
-                    key.market_id, key.side
-                ))
-            })?;
+        let mut position = self.positions.remove(key).ok_or_else(|| {
+            PolybotError::State(format!(
+                "Position not found: market={} side={:?}",
+                key.market_id, key.side
+            ))
+        })?;
         position.status = PositionStatus::Closed;
         Ok(position)
     }
 
     pub fn close_all_positions(&mut self) -> Vec<Position> {
-        self.positions
+        let closed_positions: Vec<Position> = self
+            .positions
             .drain()
             .map(|(_, mut position)| {
                 position.status = PositionStatus::Closed;
                 position
             })
-            .collect()
+            .collect();
+
+        if !closed_positions.is_empty() {
+            tracing::warn!(
+                count = closed_positions.len(),
+                "All positions closed via emergency flatten"
+            );
+        }
+
+        closed_positions
     }
 
     /// Mark a position as ghost (in Redis but not on-chain)
@@ -110,6 +117,18 @@ impl PositionManager {
 
     pub fn get_position(&self, key: &PositionKey) -> Option<&Position> {
         self.positions.get(key)
+    }
+
+    pub fn restore_positions(&mut self, positions: Vec<Position>) {
+        self.positions = positions
+            .into_iter()
+            .map(|position| {
+                (
+                    PositionKey::new(position.market_id.clone(), position.side),
+                    position,
+                )
+            })
+            .collect();
     }
 
     #[allow(dead_code)]
@@ -314,7 +333,9 @@ mod tests {
         ))
         .unwrap();
 
-        assert!(pm.get_position(&PositionKey::new("m1", Side::Yes)).is_some());
+        assert!(pm
+            .get_position(&PositionKey::new("m1", Side::Yes))
+            .is_some());
         assert!(pm.get_position(&PositionKey::new("m1", Side::No)).is_some());
         assert_eq!(pm.open_position_count(), 2);
     }
@@ -342,7 +363,9 @@ mod tests {
         let closed = pm.close_all_positions();
 
         assert_eq!(closed.len(), 2);
-        assert!(closed.iter().all(|position| position.status == PositionStatus::Closed));
+        assert!(closed
+            .iter()
+            .all(|position| position.status == PositionStatus::Closed));
         assert_eq!(pm.open_position_count(), 0);
     }
 }
