@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PolyBot Live Dashboard</title>
+    <style>
+      :root {
+        --bg: #f4f1e8;
+        --surface: rgba(255, 250, 239, 0.92);
+        --surface-strong: #fffaf0;
+        --ink: #1c1a16;
+        --muted: #5f574f;
+        --line: rgba(35, 28, 19, 0.12);
+        --accent: #0d5c63;
+        --accent-soft: #dcefed;
+        --danger: #8f2d1f;
+        --ok: #216869;
+        --shadow: 0 20px 60px rgba(37, 29, 18, 0.10);
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        padding: 24px;
+        color: var(--ink);
+        font-family: "Segoe UI Variable", "Aptos", "Trebuchet MS", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(13, 92, 99, 0.10), transparent 32%),
+          radial-gradient(circle at bottom right, rgba(143, 45, 31, 0.10), transparent 24%),
+          linear-gradient(180deg, #f8f5ef 0%, var(--bg) 100%);
+      }
+
+      .shell {
+        max-width: 1400px;
+        margin: 0 auto;
+        display: grid;
+        gap: 20px;
+      }
+
+      .hero,
+      .panel {
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(14px);
+      }
+
+      .hero {
+        padding: 24px 28px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 18px;
+      }
+
+      .hero h1,
+      .panel h2 {
+        margin: 0 0 8px;
+        font-family: Georgia, "Times New Roman", serif;
+      }
+
+      .hero p {
+        margin: 0;
+        color: var(--muted);
+      }
+
+      .refresh-bar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 11px 16px;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+        color: #f8fffe;
+        background: var(--accent);
+        box-shadow: 0 10px 24px rgba(13, 92, 99, 0.18);
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .stat {
+        padding: 18px;
+      }
+
+      .stat-label {
+        font-size: 0.85rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+      }
+
+      .stat-value {
+        margin-top: 10px;
+        font-size: 1.7rem;
+        font-weight: 800;
+      }
+
+      .columns {
+        display: grid;
+        grid-template-columns: 1.15fr 0.85fr;
+        gap: 20px;
+      }
+
+      .panel {
+        padding: 22px;
+      }
+
+      .meta {
+        display: grid;
+        gap: 10px;
+      }
+
+      .meta-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .meta-row:last-child {
+        border-bottom: 0;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 12px;
+        background: var(--surface-strong);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        overflow: hidden;
+      }
+
+      th, td {
+        text-align: left;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      th {
+        font-size: 0.85rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .pill {
+        display: inline-block;
+        padding: 5px 10px;
+        border-radius: 999px;
+        font-size: 0.85rem;
+        font-weight: 700;
+      }
+
+      .pill.ok {
+        background: rgba(33, 104, 105, 0.12);
+        color: var(--ok);
+      }
+
+      .pill.danger {
+        background: rgba(143, 45, 31, 0.12);
+        color: var(--danger);
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      @media (max-width: 1100px) {
+        .grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .columns {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 720px) {
+        body {
+          padding: 16px;
+        }
+
+        .hero {
+          flex-direction: column;
+          align-items: stretch;
+        }
+
+        .grid {
+          grid-template-columns: 1fr;
+        }
+
+        table, thead, tbody, th, td, tr {
+          display: block;
+        }
+
+        thead {
+          display: none;
+        }
+
+        tr {
+          padding: 8px 0;
+          border-bottom: 1px solid var(--line);
+        }
+
+        td {
+          border: 0;
+          padding: 6px 0;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <section class="hero">
+        <div>
+          <h1>PolyBot Live Dashboard</h1>
+          <p>Reads directly from the running bot APIs on this machine.</p>
+        </div>
+        <div class="refresh-bar">
+          <span class="muted" id="last-refresh">Waiting for first refresh...</span>
+          <button id="refresh-button" type="button">Refresh Now</button>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="panel stat">
+          <div class="stat-label">Status</div>
+          <div class="stat-value" id="status-value">-</div>
+        </article>
+        <article class="panel stat">
+          <div class="stat-label">Daily PnL</div>
+          <div class="stat-value" id="pnl-value">-</div>
+        </article>
+        <article class="panel stat">
+          <div class="stat-label">Open Positions</div>
+          <div class="stat-value" id="open-positions-value">-</div>
+        </article>
+        <article class="panel stat">
+          <div class="stat-label">Signals Processed</div>
+          <div class="stat-value" id="signals-processed-value">-</div>
+        </article>
+      </section>
+
+      <section class="columns">
+        <article class="panel">
+          <h2>System Health</h2>
+          <div class="meta" id="health-meta"></div>
+        </article>
+        <article class="panel">
+          <h2>Runtime Metrics</h2>
+          <div class="meta" id="metrics-meta"></div>
+        </article>
+      </section>
+
+      <section class="columns">
+        <article class="panel">
+          <h2>Open Positions</h2>
+          <div id="positions-container"></div>
+        </article>
+        <article class="panel">
+          <h2>Recent Signals</h2>
+          <div id="signals-container"></div>
+        </article>
+      </section>
+    </div>
+
+    <script>
+      async function fetchJson(path) {
+        const response = await fetch(path);
+        if (!response.ok) {
+          throw new Error(path + " returned " + response.status);
+        }
+        return response.json();
+      }
+
+      async function fetchText(path) {
+        const response = await fetch(path);
+        if (!response.ok) {
+          throw new Error(path + " returned " + response.status);
+        }
+        return response.text();
+      }
+
+      function setText(id, value) {
+        document.getElementById(id).textContent = value;
+      }
+
+      function pill(text, ok) {
+        const cls = ok ? "ok" : "danger";
+        return '<span class="pill ' + cls + '">' + text + "</span>";
+      }
+
+      function renderMeta(containerId, rows) {
+        const html = rows
+          .map(function(row) {
+            return '<div class="meta-row"><span class="muted">' + row.label + '</span><span>' + row.value + "</span></div>";
+          })
+          .join("");
+        document.getElementById(containerId).innerHTML = html;
+      }
+
+      function renderPositions(positions) {
+        const container = document.getElementById("positions-container");
+        if (!positions.length) {
+          container.innerHTML = '<p class="muted">No open positions.</p>';
+          return;
+        }
+
+        const rows = positions.map(function(position) {
+          return (
+            "<tr>" +
+            "<td>" + position.market_id + "</td>" +
+            "<td>" + position.side + "</td>" +
+            "<td>" + position.average_price + "</td>" +
+            "<td>" + position.current_size + "</td>" +
+            "<td>" + position.category + "</td>" +
+            "<td>" + position.status + "</td>" +
+            "</tr>"
+          );
+        }).join("");
+
+        container.innerHTML =
+          "<table><thead><tr><th>Market</th><th>Side</th><th>Avg</th><th>Size</th><th>Category</th><th>Status</th></tr></thead><tbody>" +
+          rows +
+          "</tbody></table>";
+      }
+
+      function renderSignals(signals) {
+        const container = document.getElementById("signals-container");
+        if (!signals.length) {
+          container.innerHTML = '<p class="muted">No recent signals.</p>';
+          return;
+        }
+
+        const rows = signals.map(function(signal) {
+          return (
+            "<tr>" +
+            "<td>" + signal.market_id + "</td>" +
+            "<td>" + signal.side + "</td>" +
+            "<td>" + signal.confidence + "</td>" +
+            "<td>" + signal.secret_level + "</td>" +
+            "<td>" + signal.disposition + "</td>" +
+            "</tr>"
+          );
+        }).join("");
+
+        container.innerHTML =
+          "<table><thead><tr><th>Market</th><th>Side</th><th>Conf</th><th>Secret</th><th>Disposition</th></tr></thead><tbody>" +
+          rows +
+          "</tbody></table>";
+      }
+
+      function parseMetric(metricsText, name) {
+        const prefix = name + " ";
+        const line = metricsText.split("\n").find(function(entry) {
+          return entry.startsWith(prefix);
+        });
+        if (!line) return "0";
+        return line.trim().split(/\s+/).pop();
+      }
+
+      async function refresh() {
+        try {
+          const health = await fetchJson("/health");
+          const metricsText = await fetchText("/metrics");
+          const positions = await fetchJson("/positions");
+          const signals = await fetchJson("/signals?limit=12");
+
+          setText("status-value", health.status.toUpperCase());
+          setText("pnl-value", "$" + health.daily_pnl);
+          setText("open-positions-value", String(health.open_positions));
+          setText("signals-processed-value", String(health.signals_processed));
+          setText("last-refresh", "Last refresh: " + new Date().toLocaleTimeString());
+
+          renderMeta("health-meta", [
+            { label: "Mode", value: health.simulation ? "Simulation" : "Live" },
+            { label: "Redis", value: health.redis_connected ? pill("Connected", true) : pill("Disconnected", false) },
+            { label: "WebSocket", value: health.ws_connected ? pill("Connected", true) : pill("Disconnected", false) },
+            { label: "RPC", value: health.rpc_status },
+            { label: "Paused", value: health.paused ? pill("Paused", false) : pill("Active", true) },
+            { label: "Last Signal", value: health.last_signal_at || "Never" },
+            { label: "Emergency Stops", value: String(health.emergency_stops) }
+          ]);
+
+          renderMeta("metrics-meta", [
+            { label: "Signals Received", value: String(health.signals_received) },
+            { label: "Signals Processed", value: String(health.signals_processed) },
+            { label: "Signals Skipped", value: parseMetric(metricsText, "polybot_signals_skipped_total") },
+            { label: "Trades Executed", value: parseMetric(metricsText, "polybot_trades_executed_total") },
+            { label: "Trades Simulated", value: parseMetric(metricsText, "polybot_trades_simulated_total") },
+            { label: "Trades Failed", value: parseMetric(metricsText, "polybot_trades_failed_total") },
+            { label: "Drawdown", value: (Number(parseMetric(metricsText, "polybot_drawdown_pct")) * 100).toFixed(2) + "%" },
+            { label: "Avg Latency", value: parseMetric(metricsText, "polybot_avg_latency_us") + " us" }
+          ]);
+
+          renderPositions(positions);
+          renderSignals(signals);
+        } catch (error) {
+          setText("last-refresh", "Refresh failed: " + error.message);
+        }
+      }
+
+      document.getElementById("refresh-button").addEventListener("click", refresh);
+      refresh();
+      setInterval(refresh, 5000);
+    </script>
+  </body>
+</html>

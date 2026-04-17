@@ -1,0 +1,28 @@
+# Rust build output
+/target/
+/target-dashboard/
+
+# Dashboard build output
+/polybot-dashboard/dist/
+
+# Local environment and runtime data
+/.env
+/*.db
+/*.sqlite
+/*.rdb
+/backups/
+
+# Scanner/runtime-generated files
+/signals/processed/
+
+# Worktree and local tooling artifacts
+/.worktrees/
+/worktrees/
+/.superpowers/
+
+# Editor and OS noise
+/.vscode/
+/.idea/
+*.log
+Thumbs.db
+.DS_Store

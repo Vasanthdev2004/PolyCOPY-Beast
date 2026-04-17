@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "polybot-common",
+    "polybot-core",
+    "polybot-dashboard",
+]
+resolver = "2"

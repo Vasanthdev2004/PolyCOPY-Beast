@@ -1,0 +1,21 @@
+[build]
+target = "index.html"
+dist = "dist"
+public_url = "/"
+filehash = false
+
+[[proxy]]
+rewrite = "/health"
+backend = "http://localhost:8080/health"
+
+[[proxy]]
+rewrite = "/metrics"
+backend = "http://localhost:8080/metrics"
+
+[[proxy]]
+rewrite = "/positions"
+backend = "http://localhost:8080/positions"
+
+[[proxy]]
+rewrite = "/signals"
+backend = "http://localhost:8080/signals"

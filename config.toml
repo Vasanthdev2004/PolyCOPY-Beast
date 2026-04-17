@@ -1,0 +1,44 @@
+# SuperFast PolyBot v2.5 Configuration
+# All values can be overridden via POLYBOT_<KEY> environment variables
+
+[system]
+simulation = true
+log_level = "info"
+
+[risk]
+base_size_usd = 50
+base_size_pct = 0.015       # 1.5% of portfolio
+daily_max_loss_pct = 0.05
+per_market_exposure_pct = 0.10
+per_category_exposure_pct = 0.25
+max_position_size_usd = 500
+max_concurrent_positions = 20
+max_market_liquidity_pct = 0.02
+min_confidence = 6
+min_secret_level = 5
+slippage_threshold = 0.02
+
+[scanner]
+watch_dir = "./signals"
+processed_dir = "./signals/processed"
+dedup_window_secs = 300       # 5 min rolling window per v2.5
+http_port = 8081
+
+[execution]
+slippage_threshold = 0.02
+rpc_endpoints = ["https://polygon-rpc.com", "https://rpc-mainnet.maticvigil.com"]
+ws_reconnect_max_wait_secs = 60
+heartbeat_interval_secs = 30
+order_timeout_secs = 30
+
+[telegram]
+allowed_user_ids = []
+command_rate_limit_per_min = 30
+emergency_stop_limit_per_hour = 3
+
+[redis]
+url = "redis://127.0.0.1:6379"
+
+[dashboard]
+host = "0.0.0.0"
+port = 8080
