@@ -157,7 +157,9 @@ pub async fn handle_command(
             } else {
                 "Disconnected"
             };
-            let redis = if metrics.redis_connected.load(Ordering::Relaxed) == 1 {
+            let redis = if !config.redis.enabled {
+                "Disabled"
+            } else if metrics.redis_connected.load(Ordering::Relaxed) == 1 {
                 "Connected"
             } else {
                 "Disconnected"
@@ -198,6 +200,7 @@ pub async fn handle_command(
                         let positions = rows.into_iter().map(|row| row.position).collect::<Vec<_>>();
                         format_positions_message(&positions, pnl)
                     }
+                    _ if !config.redis.enabled => fallback_positions_message(&metrics),
                     _ => match RedisStore::new(&config.redis.url).await {
                         Ok(store) => match store.list_positions().await {
                             Ok(positions) => format_positions_message(&positions, pnl),
@@ -206,6 +209,7 @@ pub async fn handle_command(
                         Err(_) => fallback_positions_message(&metrics),
                     },
                 },
+                Err(_) if !config.redis.enabled => fallback_positions_message(&metrics),
                 Err(_) => match RedisStore::new(&config.redis.url).await {
                     Ok(store) => match store.list_positions().await {
                         Ok(positions) => format_positions_message(&positions, pnl),
@@ -281,7 +285,7 @@ pub async fn handle_command(
             Some(ConfirmAction::EmergencyStop) => {
                 risk_engine.set_emergency_stop(true).await;
                 let closed_positions = state::force_flatten_positions(
-                    Some(config.redis.url.as_str()),
+                    config.redis.enabled.then_some(config.redis.url.as_str()),
                     metrics.clone(),
                     position_manager.clone(),
                 )

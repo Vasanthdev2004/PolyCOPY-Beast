@@ -49,6 +49,10 @@ fn default_use_websocket() -> bool {
     true
 }
 
+fn default_redis_enabled() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub system: SystemConfig,
@@ -131,6 +135,8 @@ pub struct TelegramConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisConfig {
+    #[serde(default = "default_redis_enabled")]
+    pub enabled: bool,
     pub url: String,
 }
 
@@ -191,6 +197,7 @@ impl Default for AppConfig {
                 emergency_stop_limit_per_hour: 3,
             },
             redis: RedisConfig {
+                enabled: default_redis_enabled(),
                 url: "redis://127.0.0.1:6379".to_string(),
             },
             dashboard: DashboardConfig {
@@ -288,7 +295,7 @@ impl AppConfig {
         }
         if self.execution.rpc_endpoints.len() < 2 {
             tracing::warn!(
-                "v2.5 requires minimum 2 RPC endpoints. Only {} configured.",
+                "Recommended: configure at least 2 RPC endpoints for better resilience. Only {} configured.",
                 self.execution.rpc_endpoints.len()
             );
         }
@@ -338,6 +345,10 @@ impl AppConfig {
         }
         if let Ok(val) = std::env::var("POLYBOT_REDIS_URL") {
             self.redis.url = val;
+        }
+        if let Ok(val) = std::env::var("POLYBOT_REDIS_ENABLED") {
+            let normalized = val.to_lowercase();
+            self.redis.enabled = normalized == "true" || normalized == "1";
         }
         if let Ok(val) =
             std::env::var("POLYBOT_DATA_API_URL").or_else(|_| std::env::var("DATA_API_URL"))
@@ -466,6 +477,21 @@ mod tests {
         config.apply_env_overrides();
         assert_eq!(config.telegram.allowed_user_ids, vec![123, 456, 789]);
         std::env::remove_var("POLYBOT_TELEGRAM_ALLOWED_USER_IDS");
+    }
+
+    #[test]
+    fn default_config_disables_redis_features() {
+        let config = AppConfig::default();
+        assert!(!config.redis.enabled);
+    }
+
+    #[test]
+    fn apply_env_overrides_redis_enabled() {
+        std::env::set_var("POLYBOT_REDIS_ENABLED", "true");
+        let mut config = AppConfig::default();
+        config.apply_env_overrides();
+        assert!(config.redis.enabled);
+        std::env::remove_var("POLYBOT_REDIS_ENABLED");
     }
 
     #[test]

@@ -12,10 +12,10 @@ pub fn App() -> impl IntoView {
 
     view! {
         <Stylesheet id="leptos" href="/style.css"/>
-        <Title text="SuperFast PolyBot v2"/>
+        <Title text="SuperFast PolyBot v3"/>
         <nav>
             <div>
-                <span>"PolyBot v2"</span>
+                <span>"PolyBot v3"</span>
             </div>
             <div>
                 <button on:click=move |_| set_page.set("dashboard")>"Dashboard"</button>

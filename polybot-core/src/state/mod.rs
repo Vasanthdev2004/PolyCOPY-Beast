@@ -119,27 +119,49 @@ pub async fn run_state_manager(
     let sqlite_path = sqlite::SqliteStore::open(std::path::Path::new(&sqlite_path))
         .map(|_| sqlite_path)
         .ok();
-    let redis_store = redis_store::RedisStore::new(&config.redis.url).await;
+    if !config.redis.enabled {
+        tracing::info!("Redis integrations disabled; state manager running SQLite + memory only");
+        metrics.set_redis_connected(false);
+        run_in_memory(
+            receiver,
+            metrics,
+            position_manager,
+            market_prices,
+            sqlite_path.as_deref(),
+            &config,
+        )
+        .await
+    } else {
+        let redis_store = redis_store::RedisStore::new(&config.redis.url).await;
 
-    match redis_store {
-        Ok(store) => {
-            tracing::info!("Connected to Redis for state persistence");
-            metrics.set_redis_connected(true);
-            run_with_redis(
-                receiver,
-                metrics,
-                position_manager,
-                market_prices,
-                &store,
-                sqlite_path.as_deref(),
-                &config,
-            )
-            .await
-        }
-        Err(e) => {
-            tracing::warn!("Redis unavailable ({}), running in memory-only mode", e);
-            metrics.set_redis_connected(false);
-            run_in_memory(receiver, metrics, position_manager, market_prices, sqlite_path.as_deref(), &config).await
+        match redis_store {
+            Ok(store) => {
+                tracing::info!("Connected to Redis for state persistence");
+                metrics.set_redis_connected(true);
+                run_with_redis(
+                    receiver,
+                    metrics,
+                    position_manager,
+                    market_prices,
+                    &store,
+                    sqlite_path.as_deref(),
+                    &config,
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::warn!("Redis unavailable ({}), running in memory-only mode", e);
+                metrics.set_redis_connected(false);
+                run_in_memory(
+                    receiver,
+                    metrics,
+                    position_manager,
+                    market_prices,
+                    sqlite_path.as_deref(),
+                    &config,
+                )
+                .await
+            }
         }
     }
 }

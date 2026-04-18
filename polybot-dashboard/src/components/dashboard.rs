@@ -5,7 +5,8 @@ use leptos::prelude::*;
 pub fn Dashboard() -> impl IntoView {
     view! {
         <div>
-            <h1>"SuperFast PolyBot v2 Dashboard"</h1>
+            <h1>"SuperFast PolyBot v3 Operator Panel"</h1>
+            <p>"Calm, fast monitoring for the automated copy-trading runtime."</p>
             <div>
                 <div>
                     <h2>"Risk Overview"</h2>
