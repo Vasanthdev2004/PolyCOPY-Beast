@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PolyBot Live Dashboard</title>
+    <title>PolyBot v3 Operator Panel</title>
     <style>
       :root {
         --bg: #f4f1e8;
@@ -506,16 +506,20 @@
           const signals = await fetchJson("/signals?limit=12");
           const executions = await fetchJson("/executions?limit=10");
 
-          setText("mode-value", health.simulation ? "SIM" : "LIVE");
+          setText("mode-value", String(health.execution_mode || (health.simulation ? "simulation" : "live")).toUpperCase());
           setText("balance-value", "$" + health.balance_usd);
           setText("pnl-value", "$" + health.daily_pnl);
           setText("drawdown-value", health.drawdown_pct + "%");
           setText("last-refresh", "Last refresh: " + new Date().toLocaleTimeString());
 
+          const redisLabel = !health.redis_enabled
+            ? pill("Optional / Off", true)
+            : (health.redis_connected ? pill("Connected", true) : pill("Disconnected", false));
+
           renderMeta("health-meta", [
             { label: "System Status", value: health.status.toUpperCase() },
             { label: "Open Positions", value: String(health.open_positions) },
-            { label: "Redis", value: health.redis_connected ? pill("Connected", true) : pill("Disconnected", false) },
+            { label: "Redis Cache", value: redisLabel },
             { label: "WebSocket", value: health.ws_connected ? pill("Connected", true) : pill("Disconnected", false) },
             { label: "RPC", value: health.rpc_status },
             { label: "Paused", value: health.paused ? pill("Paused", false) : pill("Active", true) },

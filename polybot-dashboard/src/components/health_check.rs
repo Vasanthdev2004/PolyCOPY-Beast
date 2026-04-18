@@ -57,7 +57,7 @@ pub fn HealthCheck() -> impl IntoView {
                                     Some(h) => {
                                         let status = h.status.clone();
                                         let uptime = h.uptime_secs;
-                                        let sim = h.simulation;
+                                        let mode = h.execution_mode.to_uppercase();
                                         let paused = h.paused;
                                         let signals_received = h.signals_received;
                                         let signals_processed = h.signals_processed;
@@ -66,7 +66,7 @@ pub fn HealthCheck() -> impl IntoView {
                                             <div>
                                                 <div><span>"Status: "</span><span>{status}</span></div>
                                                 <div><span>"Uptime: "</span><span>{format!("{}s", uptime)}</span></div>
-                                                <div><span>"Mode: "</span><span>{if sim { "SIMULATION" } else { "LIVE" }}</span></div>
+                                                <div><span>"Mode: "</span><span>{mode}</span></div>
                                                 <div><span>"Trading: "</span><span>{if paused { "PAUSED" } else { "Active" }}</span></div>
                                                 <div><span>"Signals Received: "</span><span>{signals_received}</span></div>
                                                 <div><span>"Signals Processed: "</span><span>{signals_processed}</span></div>
@@ -81,7 +81,13 @@ pub fn HealthCheck() -> impl IntoView {
                                 <h2>"Connections"</h2>
                                 {match h2 {
                                     Some(h) => {
-                                        let redis = h.redis_connected;
+                                        let redis_status = if !h.redis_enabled {
+                                            "Disabled"
+                                        } else if h.redis_connected {
+                                            "Connected"
+                                        } else {
+                                            "Disconnected"
+                                        };
                                         let ws = h.ws_connected;
                                         let rpc = h.rpc_status.clone();
                                         let last_signal = h
@@ -90,7 +96,7 @@ pub fn HealthCheck() -> impl IntoView {
                                             .unwrap_or_else(|| "Never".to_string());
                                         view! {
                                             <div>
-                                                <div><span>"Redis: "</span><span>{if redis { "Connected" } else { "Disconnected" }}</span></div>
+                                                <div><span>"Redis Cache: "</span><span>{redis_status}</span></div>
                                                 <div><span>"CLOB WebSocket: "</span><span>{if ws { "Connected" } else { "Disconnected" }}</span></div>
                                                 <div><span>"RPC: "</span><span>{rpc}</span></div>
                                                 <div><span>"Last Signal: "</span><span>{last_signal}</span></div>

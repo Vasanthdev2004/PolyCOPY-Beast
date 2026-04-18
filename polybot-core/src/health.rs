@@ -6,7 +6,7 @@ use std::time::SystemTime;
 use crate::risk::RiskEngine;
 use crate::metrics::Metrics;
 use crate::state::{self, positions::PositionManager, redis_store::RedisStore, sqlite::{RecentTradeRow, SignalLogEntry, SqliteStore}};
-use polybot_common::types::Position;
+use polybot_common::types::{ExecutionMode, Position};
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 
@@ -16,8 +16,10 @@ const DASHBOARD_HTML: &str = include_str!("dashboard_page.html");
 pub struct HealthState {
     pub start_time: SystemTime,
     pub simulation_mode: bool,
+    pub execution_mode: ExecutionMode,
     pub paused: bool,
     pub metrics: Arc<Metrics>,
+    pub redis_enabled: bool,
     pub redis_url: String,
     pub sqlite_path: String,
     pub starting_balance: Decimal,
@@ -45,8 +47,10 @@ pub struct HealthResponse {
     pub status: String,
     pub uptime_secs: u64,
     pub simulation: bool,
+    pub execution_mode: String,
     pub ws_connected: bool,
     pub rpc_status: String,
+    pub redis_enabled: bool,
     pub redis_connected: bool,
     pub last_signal_at: Option<String>,
     pub daily_pnl: String,
@@ -115,8 +119,10 @@ pub async fn health_check(State(state): State<Arc<HealthState>>) -> Json<HealthR
         },
         uptime_secs: uptime,
         simulation: state.simulation_mode,
+        execution_mode: state.execution_mode.as_str().to_string(),
         ws_connected,
         rpc_status,
+        redis_enabled: state.redis_enabled,
         redis_connected,
         last_signal_at: last_signal,
         daily_pnl: format!("{:.2}", metrics.daily_pnl_usd()),
@@ -190,11 +196,13 @@ pub async fn positions_handler(
     match SqliteStore::open(std::path::Path::new(&state.sqlite_path)) {
         Ok(store) => match store.list_open_positions() {
             Ok(rows) if !rows.is_empty() => Json(rows.into_iter().map(|row| row.position).collect()),
+            _ if !state.redis_enabled => Json(Vec::new()),
             _ => match RedisStore::new(&state.redis_url).await {
                 Ok(store) => Json(store.list_positions().await.unwrap_or_default()),
                 Err(_) => Json(Vec::new()),
             },
         },
+        Err(_) if !state.redis_enabled => Json(Vec::new()),
         Err(_) => match RedisStore::new(&state.redis_url).await {
             Ok(store) => Json(store.list_positions().await.unwrap_or_default()),
             Err(_) => Json(Vec::new()),
@@ -269,7 +277,7 @@ pub async fn emergency_stop_handler(
     state.metrics.record_emergency_stop();
     state.metrics.set_paused(true);
     let closed_positions = state::force_flatten_positions(
-        Some(state.redis_url.as_str()),
+        state.redis_enabled.then_some(state.redis_url.as_str()),
         state.metrics.clone(),
         state.position_manager.clone(),
     )
@@ -348,8 +356,10 @@ mod tests {
         Arc::new(HealthState {
             start_time: SystemTime::now(),
             simulation_mode: true,
+            execution_mode: ExecutionMode::Simulation,
             paused: false,
             metrics,
+            redis_enabled: false,
             redis_url: "redis://127.0.0.1:6379".to_string(),
             sqlite_path,
             starting_balance: dec!(1000),
@@ -366,6 +376,8 @@ mod tests {
         let response = health_check(State(state)).await.0;
         assert_eq!(response.balance_usd, "1000.00");
         assert_eq!(response.drawdown_pct, "0.00");
+        assert_eq!(response.execution_mode, "simulation");
+        assert!(!response.redis_enabled);
 
         let _ = std::fs::remove_file(sqlite_path);
     }
@@ -427,8 +439,10 @@ mod tests {
         let state = Arc::new(HealthState {
             start_time: SystemTime::now(),
             simulation_mode: true,
+            execution_mode: ExecutionMode::Simulation,
             paused: false,
             metrics,
+            redis_enabled: false,
             redis_url: "redis://127.0.0.1:6379".to_string(),
             sqlite_path: sqlite_path.to_string_lossy().to_string(),
             starting_balance: dec!(1000),
